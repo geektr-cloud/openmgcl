@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -35,36 +35,43 @@ jobs:
         run: go test ./...
 
   build:
-    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Build
     runs-on: ubuntu-latest
     needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        goos: [linux]
-        goarch: [amd64, arm64]
-    env:
-      CGO_ENABLED: "0"
-      GOOS: ${{ matrix.goos }}
-      GOARCH: ${{ matrix.goarch }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o "dist/mgcl-${{ matrix.goos }}-${{ matrix.goarch }}" .
+      - name: Build linux/amd64
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -ldflags="-s -w" -o dist/mgcl-linux-amd64 .
 
-      - name: Upload artifact
+      - name: Build linux/arm64
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+        run: go build -trimpath -ldflags="-s -w" -o dist/mgcl-linux-arm64 .
+
+      - name: Smoke test
+        run: ./dist/mgcl-linux-amd64 --version
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: mgcl-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/mgcl-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: mgcl-linux
+          path: |
+            dist/mgcl-linux-amd64
+            dist/mgcl-linux-arm64
           if-no-files-found: error
           retention-days: 7

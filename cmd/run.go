@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/geektr-cloud/openmgcl/internal/tacos"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -18,7 +19,8 @@ import (
 var runCmd = &cobra.Command{
 	Use:   "run [flags] [-- command [args...]]",
 	Short: "Start local MGCL server and optionally run a command",
-	Long: `Start a local HTTP server that serves /.well-known/terraform.json.
+	Long: `Start a local HTTP server that serves /.well-known/terraform.json
+and a TACOS state.v2 backend backed by SQLite.
 
 If a command is specified after --, it will be executed with TF_CLOUD_HOSTNAME
 set to the server URL. The server will be shut down when the command exits.
@@ -26,7 +28,9 @@ If no command is specified, the server runs until SIGINT/SIGTERM.
 
 Flags:
   -h, --host    Listen address (default "127.0.0.1:1217")
-  -s, --server  Base URL for Terraform (default derived from host)`,
+  -s, --server  Base URL for Terraform (default derived from host)
+  -d, --db      SQLite database path (default "mgcl.db")
+  -t, --token   Bearer token for API auth (empty = no auth)`,
 	DisableFlagParsing: true,
 	RunE:               runRun,
 }
@@ -34,23 +38,6 @@ Flags:
 func init() {
 	viper.BindPFlag("host", runCmd.Flags().Lookup("host"))
 	viper.BindPFlag("server", runCmd.Flags().Lookup("server"))
-}
-
-// terraformHandler returns an http.Handler that serves /.well-known/terraform.json.
-func terraformHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/terraform.json", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/terraform.json" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, "{}")
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	})
-	return mux
 }
 
 // deriveServerURL computes the server URL to inject into TF_CLOUD_HOSTNAME.
@@ -100,6 +87,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 	// Manual flag parsing to handle -h for host (conflicts with help)
 	host := "127.0.0.1:1217"
 	serverURL := ""
+	dbPath := "mgcl.db"
+	token := ""
 	var commandArgs []string
 
 	i := 0
@@ -120,6 +109,18 @@ func runRun(cmd *cobra.Command, args []string) error {
 			}
 			serverURL = args[i+1]
 			i += 2
+		} else if arg == "--db" || arg == "-d" {
+			if i+1 >= len(args) {
+				return fmt.Errorf("flag %s requires a value", arg)
+			}
+			dbPath = args[i+1]
+			i += 2
+		} else if arg == "--token" || arg == "-t" {
+			if i+1 >= len(args) {
+				return fmt.Errorf("flag %s requires a value", arg)
+			}
+			token = args[i+1]
+			i += 2
 		} else if arg == "--version" {
 			fmt.Printf("mgcl %s\n", version)
 			return nil
@@ -138,6 +139,19 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if serverURL == "" && viper.GetString("server") != "" {
 		serverURL = viper.GetString("server")
 	}
+	if dbPath == "mgcl.db" && viper.GetString("db") != "" {
+		dbPath = viper.GetString("db")
+	}
+	if token == "" && viper.GetString("token") != "" {
+		token = viper.GetString("token")
+	}
+
+	// Open the TACOS store
+	store, err := tacos.Open(dbPath)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer store.Close()
 
 	// Start HTTP server
 	listener, err := net.Listen("tcp", host)
@@ -152,7 +166,8 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("derive server URL: %w", err)
 	}
 
-	server := &http.Server{Handler: terraformHandler()}
+	handler := tacos.NewRouter(store, serverURL, token)
+	server := &http.Server{Handler: handler}
 
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -161,7 +176,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Server is ready since listener is already bound
-	fmt.Fprintf(os.Stderr, "MGCL server listening on %s\n", listener.Addr())
+	fmt.Fprintf(os.Stderr, "MgCl server listening on %s\n", listener.Addr())
 
 	if len(commandArgs) == 0 {
 		// No command - wait for signal

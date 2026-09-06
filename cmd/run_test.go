@@ -1,59 +1,15 @@
 package cmd
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
+
+	"github.com/geektr-cloud/openmgcl/internal/tacos"
 )
-
-func TestTerraformJSONHandler(t *testing.T) {
-	handler := terraformHandler()
-
-	tests := []struct {
-		name     string
-		path     string
-		wantCode int
-		wantBody string
-		wantCT   string
-	}{
-		{
-			name:     "terraform.json",
-			path:     "/.well-known/terraform.json",
-			wantCode: http.StatusOK,
-			wantBody: "{}",
-			wantCT:   "application/json",
-		},
-		{
-			name:     "other path",
-			path:     "/other",
-			wantCode: http.StatusNotFound,
-		},
-		{
-			name:     "terraform.json with extra path",
-			path:     "/.well-known/terraform.json/extra",
-			wantCode: http.StatusNotFound,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", tt.path, nil)
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
-
-			if w.Code != tt.wantCode {
-				t.Errorf("got status %d, want %d", w.Code, tt.wantCode)
-			}
-			if tt.wantBody != "" && w.Body.String() != tt.wantBody {
-				t.Errorf("got body %q, want %q", w.Body.String(), tt.wantBody)
-			}
-			if tt.wantCT != "" && w.Header().Get("Content-Type") != tt.wantCT {
-				t.Errorf("got content-type %q, want %q", w.Header().Get("Content-Type"), tt.wantCT)
-			}
-		})
-	}
-}
 
 func TestDeriveServerURL(t *testing.T) {
 	tests := []struct {
@@ -176,5 +132,56 @@ func TestWithTFCloudHostname(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTacosDiscovery(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "mgcl-test-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.Close()
+
+	store, err := tacos.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	serverURL := "http://127.0.0.1:1217"
+	handler := tacos.NewRouter(store, serverURL, "")
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/.well-known/terraform.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("got status %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("got content-type %q, want %q", ct, "application/json")
+	}
+
+	var doc map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode discovery doc: %v", err)
+	}
+
+	expectedSuffix := "/api/v2/"
+	for _, key := range []string{"state.v2", "tfe.v2", "tfe.v2.1"} {
+		val, ok := doc[key]
+		if !ok {
+			t.Errorf("discovery doc missing key %q", key)
+			continue
+		}
+		if val != serverURL+expectedSuffix {
+			t.Errorf("discovery[%q] = %q, want %q", key, val, serverURL+expectedSuffix)
+		}
 	}
 }

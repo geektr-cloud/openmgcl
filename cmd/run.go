@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -18,13 +20,15 @@ import (
 
 var runCmd = &cobra.Command{
 	Use:   "run [flags] [-- command [args...]]",
-	Short: "Start local MGCL server and optionally run a command",
+	Short: "Start local MgCl server and optionally run a command",
 	Long: `Start a local HTTP server that serves /.well-known/terraform.json
 and a TACOS state.v2 backend backed by SQLite.
 
 If a command is specified after --, it will be executed with TF_CLOUD_HOSTNAME
-set to the server URL. The server will be shut down when the command exits.
-If no command is specified, the server runs until SIGINT/SIGTERM.
+and TF_CLI_CONFIG_FILE set up so OpenTofu can reach the local server. An existing
+TF_CLI_CONFIG_FILE is preserved and extended. The server will be shut down when
+the command exits. If no command is specified, the server runs until
+SIGINT/SIGTERM.
 
 Flags:
   -h, --host    Listen address (default "127.0.0.1:1217")
@@ -35,12 +39,7 @@ Flags:
 	RunE:               runRun,
 }
 
-func init() {
-	viper.BindPFlag("host", runCmd.Flags().Lookup("host"))
-	viper.BindPFlag("server", runCmd.Flags().Lookup("server"))
-}
-
-// deriveServerURL computes the server URL to inject into TF_CLOUD_HOSTNAME.
+// deriveServerURL computes the server URL for discovery and upload/download links.
 // If explicitServer is non-empty, it is used as-is (with trailing slashes trimmed).
 // Otherwise, the URL is derived from host, using listenerAddr for the actual port
 // when the host port is 0.
@@ -71,16 +70,151 @@ func deriveServerURL(host string, listenerAddr net.Addr, explicitServer string) 
 	return fmt.Sprintf("http://%s:%s", h, port), nil
 }
 
-// withTFCloudHostname returns a copy of env with TF_CLOUD_HOSTNAME set to server.
-// Any existing TF_CLOUD_HOSTNAME entries are removed first.
-func withTFCloudHostname(env []string, server string) []string {
-	filtered := make([]string, 0, len(env)+1)
-	for _, e := range env {
-		if !strings.HasPrefix(e, "TF_CLOUD_HOSTNAME=") {
-			filtered = append(filtered, e)
+// hostFromServerURL returns the host[:port] portion of serverURL, which is the
+// format TF_CLOUD_HOSTNAME expects. If serverURL has no scheme it is treated as
+// a bare host.
+func hostFromServerURL(serverURL string) string {
+	if strings.Contains(serverURL, "://") {
+		if u, err := url.Parse(serverURL); err == nil && u.Host != "" {
+			return u.Host
 		}
 	}
-	return append(filtered, "TF_CLOUD_HOSTNAME="+server)
+	return strings.TrimRight(serverURL, "/")
+}
+
+// withEnv returns a copy of env with the given KEY=VALUE pairs set. Any
+// existing entries with the same keys are removed first.
+func withEnv(env []string, kv ...string) []string {
+	replace := make(map[string]struct{}, len(kv))
+	for _, pair := range kv {
+		if key, _, ok := strings.Cut(pair, "="); ok {
+			replace[key] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(env)+len(kv))
+	for _, e := range env {
+		if key, _, ok := strings.Cut(e, "="); ok {
+			if _, replaced := replace[key]; replaced {
+				continue
+			}
+		}
+		out = append(out, e)
+	}
+	return append(out, kv...)
+}
+
+// hclQuote returns s as an HCL quoted string literal.
+func hclQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// hasHostBlock reports whether cfg already declares a host block for hostname.
+// The check is textual because adding a duplicate host block would make
+// OpenTofu reject the generated CLI config.
+func hasHostBlock(cfg, hostname string) bool {
+	re := regexp.MustCompile(`(?m)^\s*host\s+"` + regexp.QuoteMeta(hostname) + `"\s*\{`)
+	return re.MatchString(cfg)
+}
+
+// buildCLIConfig appends a host block pointing at the local server to existing
+// CLI config content. If the user already configured this host, their config is
+// returned unchanged and wins.
+func buildCLIConfig(existing, serverURL, hostname, token string) string {
+	if hasHostBlock(existing, hostname) {
+		return existing
+	}
+
+	var b strings.Builder
+	b.WriteString(existing)
+	if existing != "" {
+		if !strings.HasSuffix(existing, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("host ")
+	b.WriteString(hclQuote(hostname))
+	b.WriteString(" {\n  services = {\n")
+	for _, svc := range []struct {
+		id  string
+		pad string
+	}{
+		{"state.v2", " "},
+		{"tfe.v2", "   "},
+		{"tfe.v2.1", " "},
+	} {
+		b.WriteString("    ")
+		b.WriteString(hclQuote(svc.id))
+		b.WriteString(svc.pad)
+		b.WriteString("= ")
+		b.WriteString(hclQuote(strings.TrimRight(serverURL, "/") + "/api/v2/"))
+		b.WriteString("\n")
+	}
+	b.WriteString("  }\n}\n")
+
+	if token != "" {
+		b.WriteString("\ncredentials ")
+		b.WriteString(hclQuote(hostname))
+		b.WriteString(" {\n  token = ")
+		b.WriteString(hclQuote(token))
+		b.WriteString("\n}\n")
+	}
+	return b.String()
+}
+
+// prepareCLIConfig writes a temporary OpenTofu CLI config that points hostname
+// at serverURL, preserving any existing TF_CLI_CONFIG_FILE content. The caller
+// must invoke cleanup after the child process exits.
+func prepareCLIConfig(serverURL, hostname, token string) (path string, cleanup func(), err error) {
+	existing := ""
+	if p := os.Getenv("TF_CLI_CONFIG_FILE"); p != "" {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return "", nil, fmt.Errorf("read TF_CLI_CONFIG_FILE %q: %w", p, err)
+		}
+		existing = string(data)
+	}
+
+	content := buildCLIConfig(existing, serverURL, hostname, token)
+
+	f, err := os.CreateTemp("", "mgcl-tofu-*.tfrc")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temporary tofu CLI config: %w", err)
+	}
+	// os.CreateTemp creates the file with mode 0600, which matters because the
+	// config may contain a Bearer token.
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", nil, fmt.Errorf("write temporary tofu CLI config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", nil, fmt.Errorf("close temporary tofu CLI config: %w", err)
+	}
+
+	return f.Name(), func() { os.Remove(f.Name()) }, nil
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
@@ -197,8 +331,20 @@ func runRun(cmd *cobra.Command, args []string) error {
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
 
-	// Set up environment with TF_CLOUD_HOSTNAME (deduped)
-	execCmd.Env = withTFCloudHostname(os.Environ(), serverURL)
+	// Point OpenTofu at the local server. TF_CLOUD_HOSTNAME must be host[:port];
+	// TF_CLI_CONFIG_FILE carries the http service URLs and credentials.
+	hostname := hostFromServerURL(serverURL)
+	cliConfigPath, cleanupConfig, err := prepareCLIConfig(serverURL, hostname, token)
+	if err != nil {
+		server.Shutdown(context.Background())
+		return err
+	}
+	defer cleanupConfig()
+
+	execCmd.Env = withEnv(os.Environ(),
+		"TF_CLOUD_HOSTNAME="+hostname,
+		"TF_CLI_CONFIG_FILE="+cliConfigPath,
+	)
 
 	// Handle signals during command execution
 	sigCh := make(chan os.Signal, 1)

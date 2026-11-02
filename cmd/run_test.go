@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/geektr-cloud/openmgcl/internal/tacos"
@@ -87,42 +89,71 @@ func TestDeriveServerURL(t *testing.T) {
 	}
 }
 
-func TestWithTFCloudHostname(t *testing.T) {
+func TestHostFromServerURL(t *testing.T) {
 	tests := []struct {
-		name   string
-		env    []string
-		server string
-		want   []string
+		name      string
+		serverURL string
+		want      string
+	}{
+		{"http URL", "http://127.0.0.1:1217", "127.0.0.1:1217"},
+		{"https URL", "https://example.com", "example.com"},
+		{"trailing slash", "http://example.com/", "example.com"},
+		{"ipv6", "http://[::1]:1217", "[::1]:1217"},
+		{"bare host and port", "127.0.0.1:1217", "127.0.0.1:1217"},
+		{"bare hostname", "example.com", "example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostFromServerURL(tt.serverURL); got != tt.want {
+				t.Errorf("hostFromServerURL(%q) = %q, want %q", tt.serverURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWithEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		kv   []string
+		want []string
 	}{
 		{
-			name:   "no existing var",
-			env:    []string{"PATH=/usr/bin", "HOME=/root"},
-			server: "http://127.0.0.1:1217",
-			want:   []string{"PATH=/usr/bin", "HOME=/root", "TF_CLOUD_HOSTNAME=http://127.0.0.1:1217"},
+			name: "no existing vars",
+			env:  []string{"PATH=/usr/bin", "HOME=/root"},
+			kv:   []string{"TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
+			want: []string{"PATH=/usr/bin", "HOME=/root", "TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
 		},
 		{
-			name:   "overwrites existing var",
-			env:    []string{"PATH=/usr/bin", "TF_CLOUD_HOSTNAME=http://bad", "HOME=/root"},
-			server: "http://127.0.0.1:1217",
-			want:   []string{"PATH=/usr/bin", "HOME=/root", "TF_CLOUD_HOSTNAME=http://127.0.0.1:1217"},
+			name: "overwrites existing var",
+			env:  []string{"PATH=/usr/bin", "TF_CLOUD_HOSTNAME=bad", "HOME=/root"},
+			kv:   []string{"TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
+			want: []string{"PATH=/usr/bin", "HOME=/root", "TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
 		},
 		{
-			name:   "removes multiple existing vars",
-			env:    []string{"TF_CLOUD_HOSTNAME=bad1", "PATH=/usr/bin", "TF_CLOUD_HOSTNAME=bad2"},
-			server: "http://127.0.0.1:1217",
-			want:   []string{"PATH=/usr/bin", "TF_CLOUD_HOSTNAME=http://127.0.0.1:1217"},
+			name: "removes multiple existing vars",
+			env:  []string{"TF_CLOUD_HOSTNAME=bad1", "PATH=/usr/bin", "TF_CLOUD_HOSTNAME=bad2"},
+			kv:   []string{"TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
+			want: []string{"PATH=/usr/bin", "TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
 		},
 		{
-			name:   "empty env",
-			env:    nil,
-			server: "http://127.0.0.1:1217",
-			want:   []string{"TF_CLOUD_HOSTNAME=http://127.0.0.1:1217"},
+			name: "multiple keys",
+			env:  []string{"A=1", "B=2", "C=3"},
+			kv:   []string{"B=20", "D=4"},
+			want: []string{"A=1", "C=3", "B=20", "D=4"},
+		},
+		{
+			name: "empty env",
+			env:  nil,
+			kv:   []string{"TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
+			want: []string{"TF_CLOUD_HOSTNAME=127.0.0.1:1217"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := withTFCloudHostname(tt.env, tt.server)
+			got := withEnv(tt.env, tt.kv...)
 			if len(got) != len(tt.want) {
 				t.Fatalf("got %d entries, want %d: %v", len(got), len(tt.want), got)
 			}
@@ -132,6 +163,90 @@ func TestWithTFCloudHostname(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildCLIConfig(t *testing.T) {
+	const (
+		serverURL = "http://127.0.0.1:1217"
+		hostname  = "127.0.0.1:1217"
+	)
+
+	t.Run("adds host block and credentials", func(t *testing.T) {
+		cfg := buildCLIConfig("", serverURL, hostname, "secret")
+		for _, want := range []string{
+			`host "127.0.0.1:1217" {`,
+			`"state.v2" = "http://127.0.0.1:1217/api/v2/"`,
+			`"tfe.v2"   = "http://127.0.0.1:1217/api/v2/"`,
+			`"tfe.v2.1" = "http://127.0.0.1:1217/api/v2/"`,
+			`credentials "127.0.0.1:1217" {`,
+			`token = "secret"`,
+		} {
+			if !strings.Contains(cfg, want) {
+				t.Errorf("config missing %q:\n%s", want, cfg)
+			}
+		}
+	})
+
+	t.Run("omits credentials without token", func(t *testing.T) {
+		cfg := buildCLIConfig("", serverURL, hostname, "")
+		if strings.Contains(cfg, "credentials") {
+			t.Errorf("config should not contain credentials:\n%s", cfg)
+		}
+	})
+
+	t.Run("preserves existing content", func(t *testing.T) {
+		existing := "# my config\n"
+		cfg := buildCLIConfig(existing, serverURL, hostname, "")
+		if !strings.HasPrefix(cfg, existing) {
+			t.Errorf("config does not start with existing content:\n%s", cfg)
+		}
+	})
+
+	t.Run("does not duplicate host block", func(t *testing.T) {
+		existing := "host \"127.0.0.1:1217\" {\n}\n"
+		cfg := buildCLIConfig(existing, serverURL, hostname, "secret")
+		if cfg != existing {
+			t.Errorf("existing host block should win, got:\n%s", cfg)
+		}
+	})
+
+	t.Run("escapes token", func(t *testing.T) {
+		cfg := buildCLIConfig("", serverURL, hostname, "a\"b\\c")
+		if !strings.Contains(cfg, `token = "a\"b\\c"`) {
+			t.Errorf("token not escaped:\n%s", cfg)
+		}
+	})
+}
+
+func TestPrepareCLIConfigMergesExisting(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing.tfrc")
+	if err := os.WriteFile(existing, []byte("# existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TF_CLI_CONFIG_FILE", existing)
+
+	path, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), "# existing\n") {
+		t.Errorf("temporary config does not preserve existing content:\n%s", data)
+	}
+	if !strings.Contains(string(data), `host "127.0.0.1:1217" {`) {
+		t.Errorf("temporary config missing host block:\n%s", data)
+	}
+
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("temporary config was not removed: %v", err)
 	}
 }
 

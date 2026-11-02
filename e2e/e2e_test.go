@@ -419,6 +419,60 @@ resource "terraform_data" "x" {
 	}
 }
 
+func TestE2ERunCommand(t *testing.T) {
+	requireTofu(t)
+
+	bin := buildMgcl(t)
+	workdir := t.TempDir()
+	dbPath := filepath.Join(workdir, "mgcl.db")
+
+	org := "e2e-run-org"
+	wsName := "e2e-run-" + time.Now().Format("20060102150405")
+	tfContent := fmt.Sprintf(`
+terraform {
+  cloud {
+    organization = %q
+    workspaces {
+      name = %q
+    }
+  }
+}
+
+resource "terraform_data" "x" {
+  input = "v1"
+}
+`, org, wsName)
+	if err := os.WriteFile(filepath.Join(workdir, "main.tf"), []byte(tfContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// No TF_CLI_CONFIG_FILE or TF_CLOUD_HOSTNAME here: "mgcl run --" must set
+	// them up itself so tofu can reach the local server.
+	cmd := exec.CommandContext(ctx, bin,
+		"run", "--host", "127.0.0.1:0", "--db", dbPath, "--token", "test-token",
+		"--", "sh", "-c", "tofu init -input=false && tofu apply -auto-approve -input=false",
+	)
+	cmd.Dir = workdir
+	cmd.Env = baseEnv()
+
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	err := cmd.Run()
+	out := buf.String()
+	t.Logf("mgcl run output:\n%s", out)
+	if err != nil {
+		t.Fatalf("mgcl run failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Apply complete") {
+		t.Fatalf("expected 'Apply complete' in output:\n%s", out)
+	}
+}
+
 func TestE2ELockConflict(t *testing.T) {
 	requireTofu(t)
 

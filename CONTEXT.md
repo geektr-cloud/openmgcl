@@ -7,7 +7,7 @@ OpenMgCl（mgcl）是一个本地开发辅助工具：启动一个本地 HTTP �
 **OpenMgCl**:
 项目名称。MgCl₂（氯化镁）是豆腐点卤的凝固剂——把豆浆固化成 tofu 的物质，呼应本项目为 OpenTofu 提供后端、让 tofu "成形" 的定位。
 _大小写规范_: 用户可见文案用 `MgCl`（如 `OpenMgCl`、`MgCl server listening on`）；二进制名与代码标识符用小写 `mgcl`；环境变量前缀用大写 `MGCL_`。
-_Avoid_: OpenMGCL, OpenMGCL CLI（旧写法，已废弃）
+_Avoid_: OpenMGCL, OpenMGCL CLI, MetaGaming Cloud（旧写法，已废弃）
 
 **TACOS**:
 TF Automation and Collaboration Software 的缩写，指 OpenTofu/Terraform 的远程自动化协作服务协议族。本项目只实现其中的状态存储子集。

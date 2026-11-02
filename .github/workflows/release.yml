@@ -30,6 +30,11 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version: latest
+
       - name: Test
         run: go test ./...
 

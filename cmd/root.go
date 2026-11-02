@@ -12,8 +12,8 @@ var version = "dev"
 
 var rootCmd = &cobra.Command{
 	Use:     "mgcl",
-	Short:   "OpenMGCL CLI",
-	Long:    "OpenMGCL - Open MetaGaming Cloud Local development helper",
+	Short:   "OpenMgCl CLI",
+	Long:    "OpenMgCl - a local TACOS state backend for OpenTofu",
 	Version: version,
 }
 

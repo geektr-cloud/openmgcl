@@ -1,3 +1,4 @@
 mgcl
+mgcl.db*
 dist/
 .codegraph/

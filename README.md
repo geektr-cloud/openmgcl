@@ -4,6 +4,8 @@ OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状�
 
 名字来自 MgCl₂（氯化镁）——豆腐点卤的凝固剂，呼应"给 OpenTofu 提供后端、让 tofu 成形"的定位。
 
+> 从零开始的完整操作流程见 [UserStory.md](UserStory.md)。
+
 ## 状态
 
 已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。e2e 覆盖 remote backend、cloud block、lock 冲突和 `mgcl run --`。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。

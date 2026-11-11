@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"github.com/geektr-cloud/openmgcl/internal/tacos"
+	"golang.org/x/crypto/ssh"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -182,6 +186,40 @@ func baseEnv(extra ...string) []string {
 	return env
 }
 
+// writeTestIdentity writes a temporary unencrypted Ed25519 OpenSSH key.
+func writeTestIdentity(t *testing.T) string {
+	t.Helper()
+	return writeTestIdentityAt(t, filepath.Join(t.TempDir(), "id_ed25519"))
+}
+
+func writeTestIdentityAt(t *testing.T, path string) string {
+	t.Helper()
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(private, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func loadTestIdentity(t *testing.T, path string) *tacos.Identity {
+	t.Helper()
+	identity, err := tacos.LoadIdentity(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
 // apiDo sends an HTTP request with optional Bearer token and returns the response.
 func apiDo(t *testing.T, method, url, token string, body *strings.Reader) *http.Response {
 	t.Helper()
@@ -288,7 +326,11 @@ func TestE2ERemoteBackendBinary(t *testing.T) {
 	dbPath := filepath.Join(workdir, "mgcl.db")
 
 	// Start mgcl with --host 127.0.0.1:0 to get a dynamic port.
-	_, serverURL := startMgcl(t, bin, "--host", "127.0.0.1:0", "--db", dbPath, "--token", "test-token")
+	identityPath := writeTestIdentity(t)
+	_, serverURL := startMgcl(t, bin,
+		"--host", "127.0.0.1:0", "--db", dbPath, "--token", "test-token",
+		"--encryption-key-file", identityPath,
+	)
 	hostPort := strings.TrimPrefix(serverURL, "http://")
 
 	// Write CLI config pointing tofu at mgcl.
@@ -357,8 +399,9 @@ func TestE2ECloudBlock(t *testing.T) {
 
 	workdir := t.TempDir()
 	dbPath := filepath.Join(workdir, "mgcl.db")
+	identityPath := writeTestIdentity(t)
 
-	store, err := tacos.Open(dbPath)
+	store, err := tacos.Open(dbPath, loadTestIdentity(t, identityPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,12 +494,14 @@ resource "terraform_data" "x" {
 
 	// No TF_CLI_CONFIG_FILE or TF_CLOUD_HOSTNAME here: "mgcl run --" must set
 	// them up itself so tofu can reach the local server.
+	identityPath := writeTestIdentity(t)
 	cmd := exec.CommandContext(ctx, bin,
 		"run", "--host", "127.0.0.1:0", "--db", dbPath, "--token", "test-token",
-		"--", "sh", "-c", "tofu init -input=false && tofu apply -auto-approve -input=false",
+		"--encryption-key-file", identityPath,
+		"--", "sh", "-c", `test -z "${MGCL_ENCRYPTION_KEY_PASSPHRASE:-}" && tofu init -input=false && tofu apply -auto-approve -input=false`,
 	)
 	cmd.Dir = workdir
-	cmd.Env = baseEnv()
+	cmd.Env = baseEnv("MGCL_ENCRYPTION_KEY_PASSPHRASE=must-not-reach-child")
 
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -473,13 +518,191 @@ resource "terraform_data" "x" {
 	}
 }
 
+func TestE2EEncryptionRequiresOwningKey(t *testing.T) {
+	requireTofu(t)
+
+	bin := buildMgcl(t)
+	workdir := t.TempDir()
+	dbPath := filepath.Join(workdir, "mgcl.db")
+	identity1 := writeTestIdentity(t)
+	identity2 := writeTestIdentity(t)
+
+	org := "e2e-encryption-org"
+	wsName := "e2e-encryption-" + time.Now().Format("20060102150405")
+	tfContent := fmt.Sprintf(`
+terraform {
+  cloud {
+    organization = %q
+    workspaces {
+      name = %q
+    }
+  }
+}
+
+resource "terraform_data" "x" {
+  input = "v1"
+}
+`, org, wsName)
+	if err := os.WriteFile(filepath.Join(workdir, "main.tf"), []byte(tfContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(identity, script string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin,
+			"run", "--host", "127.0.0.1:0", "--db", dbPath, "--token", "test-token",
+			"--encryption-key-file", identity, "--", "sh", "-c", script,
+		)
+		cmd.Dir = workdir
+		cmd.Env = baseEnv()
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		err := cmd.Run()
+		t.Logf("mgcl run (%s): %v\n%s", script, err, buf.String())
+		return buf.String(), err
+	}
+
+	if _, err := run(identity1, "tofu init -input=false && tofu apply -auto-approve -input=false"); err != nil {
+		t.Fatalf("owner failed to apply: %v", err)
+	}
+
+	out, err := run(identity2, "tofu init -input=false && tofu plan -input=false")
+	if err == nil {
+		t.Fatalf("second identity unexpectedly accessed the state:\n%s", out)
+	}
+	if !strings.Contains(out, "not accessible with the configured recipient") {
+		t.Fatalf("expected recipient access error, got:\n%s", out)
+	}
+}
+
+func TestE2EEncryptionKeyFileSources(t *testing.T) {
+	bin := buildMgcl(t)
+
+	run := func(t *testing.T, dir string, env []string, args ...string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, args...)
+		cmd.Dir = dir
+		cmd.Env = env
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("mgcl failed: %v\n%s", err, buf.String())
+		}
+	}
+
+	t.Run("environment", func(t *testing.T) {
+		dir := t.TempDir()
+		key := writeTestIdentity(t)
+		db := filepath.Join(dir, "mgcl.db")
+		run(t, dir, baseEnv("MGCL_ENCRYPTION_KEY_FILE="+key),
+			"run", "--host", "127.0.0.1:0", "--db", db, "--", "sh", "-c", "true")
+		if _, err := os.Stat(db); err != nil {
+			t.Fatalf("database was not created: %v", err)
+		}
+	})
+
+	t.Run("config file", func(t *testing.T) {
+		dir := t.TempDir()
+		key := writeTestIdentity(t)
+		db := filepath.Join(dir, "mgcl.db")
+		config := fmt.Sprintf("host: \"127.0.0.1:0\"\ndb: %q\nencryption_key_file: %q\n", db, key)
+		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		run(t, dir, baseEnv(), "run", "--", "sh", "-c", "true")
+		if _, err := os.Stat(db); err != nil {
+			t.Fatalf("database was not created: %v", err)
+		}
+	})
+
+	t.Run("flag overrides environment", func(t *testing.T) {
+		dir := t.TempDir()
+		goodKey := writeTestIdentity(t)
+		badKey := filepath.Join(dir, "missing-key")
+		db := filepath.Join(dir, "mgcl.db")
+		run(t, dir, baseEnv("MGCL_ENCRYPTION_KEY_FILE="+badKey),
+			"run", "--host", "127.0.0.1:0", "--db", db,
+			"--encryption-key-file", goodKey,
+			"--", "sh", "-c", "true")
+		if _, err := os.Stat(db); err != nil {
+			t.Fatalf("database was not created: %v", err)
+		}
+	})
+}
+
+func TestE2EMissingEncryptionKeyDoesNotCreateDB(t *testing.T) {
+	bin := buildMgcl(t)
+	workdir := t.TempDir()
+	dbPath := filepath.Join(workdir, "mgcl.db")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin,
+		"run", "--host", "127.0.0.1:0", "--db", dbPath,
+		"--encryption-key-file", filepath.Join(workdir, "missing-key"),
+	)
+	cmd.Dir = workdir
+	cmd.Env = baseEnv()
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("mgcl started without an encryption key")
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("database was created before key validation: %v", statErr)
+	}
+	if !strings.Contains(buf.String(), "load encryption key") {
+		t.Fatalf("unexpected error:\n%s", buf.String())
+	}
+}
+
+func TestE2EDefaultEncryptionKeyPath(t *testing.T) {
+	bin := buildMgcl(t)
+	workdir := t.TempDir()
+	home := filepath.Join(workdir, "home")
+	dbPath := filepath.Join(workdir, "mgcl.db")
+	writeTestIdentityAt(t, filepath.Join(home, ".ssh", "id_ed25519"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin,
+		"run", "--host", "127.0.0.1:0", "--db", dbPath, "--", "sh", "-c", "true",
+	)
+	cmd.Dir = workdir
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + home,
+		"CHECKPOINT_DISABLE=1",
+	}
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("default key path failed: %v\n%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "MgCl server listening on") {
+		t.Fatalf("server did not start:\n%s", buf.String())
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database was not created: %v", err)
+	}
+}
+
 func TestE2ELockConflict(t *testing.T) {
 	requireTofu(t)
 
 	workdir := t.TempDir()
 	dbPath := filepath.Join(workdir, "mgcl.db")
+	identityPath := writeTestIdentity(t)
 
-	store, err := tacos.Open(dbPath)
+	store, err := tacos.Open(dbPath, loadTestIdentity(t, identityPath))
 	if err != nil {
 		t.Fatal(err)
 	}

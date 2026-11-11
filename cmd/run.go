@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -31,10 +32,11 @@ the command exits. If no command is specified, the server runs until
 SIGINT/SIGTERM.
 
 Flags:
-  -h, --host    Listen address (default "127.0.0.1:1217")
-  -s, --server  Base URL for Terraform (default derived from host)
-  -d, --db      SQLite database path (default "mgcl.db")
-  -t, --token   Bearer token for API auth (empty = no auth)`,
+  -h, --host                  Listen address (default "127.0.0.1:1217")
+  -s, --server                Base URL for Terraform (default derived from host)
+  -d, --db                    SQLite database path (default "mgcl.db")
+  -t, --token                 Bearer token for API auth (empty = no auth)
+      --encryption-key-file   SSH Ed25519 private key (default "~/.ssh/id_ed25519")`,
 	DisableFlagParsing: true,
 	RunE:               runRun,
 }
@@ -102,6 +104,25 @@ func withEnv(env []string, kv ...string) []string {
 		out = append(out, e)
 	}
 	return append(out, kv...)
+}
+
+// dropEnv returns a copy of env without the given keys.
+func dropEnv(env []string, keys ...string) []string {
+	drop := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		drop[key] = struct{}{}
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok {
+			if _, dropped := drop[key]; dropped {
+				continue
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // hclQuote returns s as an HCL quoted string literal.
@@ -223,6 +244,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	serverURL := ""
 	dbPath := "mgcl.db"
 	token := ""
+	encryptionKeyFile := ""
 	var commandArgs []string
 
 	i := 0
@@ -255,6 +277,12 @@ func runRun(cmd *cobra.Command, args []string) error {
 			}
 			token = args[i+1]
 			i += 2
+		} else if arg == "--encryption-key-file" {
+			if i+1 >= len(args) {
+				return fmt.Errorf("flag %s requires a value", arg)
+			}
+			encryptionKeyFile = args[i+1]
+			i += 2
 		} else if arg == "--version" {
 			fmt.Printf("mgcl %s\n", version)
 			return nil
@@ -279,9 +307,24 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if token == "" && viper.GetString("token") != "" {
 		token = viper.GetString("token")
 	}
+	if encryptionKeyFile == "" && viper.GetString("encryption_key_file") != "" {
+		encryptionKeyFile = viper.GetString("encryption_key_file")
+	}
+	if encryptionKeyFile == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("resolve home directory for encryption key: %w", err)
+		}
+		encryptionKeyFile = filepath.Join(home, ".ssh", "id_ed25519")
+	}
+
+	identity, err := loadEncryptionIdentity(encryptionKeyFile)
+	if err != nil {
+		return fmt.Errorf("load encryption key: %w", err)
+	}
 
 	// Open the TACOS store
-	store, err := tacos.Open(dbPath)
+	store, err := tacos.Open(dbPath, identity)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -341,7 +384,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 	defer cleanupConfig()
 
-	execCmd.Env = withEnv(os.Environ(),
+	execCmd.Env = withEnv(dropEnv(os.Environ(), passphraseEnv),
 		"TF_CLOUD_HOSTNAME="+hostname,
 		"TF_CLI_CONFIG_FILE="+cliConfigPath,
 	)

@@ -22,7 +22,7 @@ func newTestServer(t *testing.T, token string) (*httptest.Server, *Store) {
 	f.Close()
 	t.Cleanup(func() { os.Remove(f.Name()) })
 
-	store, err := Open(f.Name())
+	store, err := Open(f.Name(), testIdentity(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,8 +345,9 @@ func TestFallbackInlineState(t *testing.T) {
 	resp := postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
 			"attributes": map[string]any{
-				"serial": 1,
-				"state":  b64State,
+				"serial":  1,
+				"lineage": "fallback-lineage",
+				"state":   b64State,
 			},
 		},
 	}, "")
@@ -375,6 +376,36 @@ func TestFallbackInlineState(t *testing.T) {
 	}
 }
 
+func TestInvalidInlineJSONBase64(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	defer ts.Close()
+
+	postJSON(t, ts.URL+"/api/v2/organizations/dev/workspaces", map[string]any{
+		"data": map[string]any{"attributes": map[string]any{"name": "bad-json"}},
+	}, "").Body.Close()
+	ws := get(t, ts.URL+"/api/v2/organizations/dev/workspaces/bad-json", "")
+	wsData := decodeJSON(t, ws)
+	ws.Body.Close()
+	wsID := wsData["data"].(map[string]any)["id"].(string)
+	url := fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID)
+
+	for name, attrs := range map[string]map[string]any{
+		"json-state":         {"serial": 1, "lineage": "invalid-b64", "json-state": "%%%"},
+		"json-state-outputs": {"serial": 2, "lineage": "invalid-b64", "json-state-outputs": "%%%"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := postJSON(t, url, map[string]any{
+				"data": map[string]any{"attributes": attrs},
+			}, "")
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnprocessableEntity {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want 422: %s", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
 func TestSerialConflict(t *testing.T) {
 	ts, _ := newTestServer(t, "")
 	defer ts.Close()
@@ -393,7 +424,7 @@ func TestSerialConflict(t *testing.T) {
 	// Create sv with serial=5
 	resp := postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
-			"attributes": map[string]any{"serial": 5, "state": b64State},
+			"attributes": map[string]any{"serial": 5, "lineage": "serial-lineage", "state": b64State},
 		},
 	}, "")
 	resp.Body.Close()
@@ -404,7 +435,7 @@ func TestSerialConflict(t *testing.T) {
 	// serial=5 again → 409 conflict
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
-			"attributes": map[string]any{"serial": 5, "state": b64State},
+			"attributes": map[string]any{"serial": 5, "lineage": "serial-lineage", "state": b64State},
 		},
 	}, "")
 	resp.Body.Close()
@@ -415,7 +446,7 @@ func TestSerialConflict(t *testing.T) {
 	// serial=3 (less than finalized max of 5) → 409
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
-			"attributes": map[string]any{"serial": 3, "state": b64State},
+			"attributes": map[string]any{"serial": 3, "lineage": "serial-lineage", "state": b64State},
 		},
 	}, "")
 	resp.Body.Close()
@@ -426,7 +457,7 @@ func TestSerialConflict(t *testing.T) {
 	// force:true bypasses serial check
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
-			"attributes": map[string]any{"serial": 3, "state": b64State, "force": true},
+			"attributes": map[string]any{"serial": 3, "lineage": "serial-lineage", "state": b64State, "force": true},
 		},
 	}, "")
 	resp.Body.Close()
@@ -511,7 +542,7 @@ func TestAuthentication(t *testing.T) {
 	wsID := wsData["data"].(map[string]any)["id"].(string)
 
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
-		"data": map[string]any{"attributes": map[string]any{"serial": 0}},
+		"data": map[string]any{"attributes": map[string]any{"serial": 0, "lineage": "auth-lineage"}},
 	}, "secret-token")
 	svResp := decodeJSON(t, resp)
 	resp.Body.Close()

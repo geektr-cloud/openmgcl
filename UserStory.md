@@ -52,7 +52,15 @@ resource "terraform_data" "hello" {
 printf '.terraform/\nmgcl.db*\n' > .gitignore
 ```
 
-`mgcl.db` 就是你的 state，地位等同于原来的 `terraform.tfstate`。
+`mgcl.db` 就是你的 state，地位等同于原来的 `terraform.tfstate`，并且 state 内容在数据库里是加密的。
+
+mgcl 强制使用 SSH Ed25519 私钥，默认读取 `~/.ssh/id_ed25519`。没有默认私钥时先创建：
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+```
+
+要用其他私钥，在每条 `mgcl run` 后加 `--encryption-key-file <path>`。
 
 OpenTofu 的 cloud backend 启动时要求有一个 token。这里给一个本地固定值即可，mgcl 会把它同时配给本地服务和 OpenTofu：
 
@@ -126,11 +134,12 @@ rm -f mgcl.db mgcl.db-wal mgcl.db-shm
 
 `destroy` 只销毁资源，不会删除 state 数据库。确认不再需要这份 state 后，再删 `mgcl.db*`。
 
-## 记住三件事
+## 记住四件事
 
 1. **`mgcl.db` 就是 state**：不要提交到 git，备份和删除都要像对待 `terraform.tfstate` 一样谨慎。
-2. **每条 `mgcl run -- ...` 都是临时服务**：在同一个项目目录、用同一个 `mgcl.db`，state 就连续。
-3. **mgcl 只做 state 存储**：没有远程运行、变量、策略、团队权限等远程协作功能。
+2. **私钥就是解密条件**：私钥丢失后 state 无法恢复；备份 `mgcl.db` 时必须同时备份私钥。
+3. **每条 `mgcl run -- ...` 都是临时服务**：在同一个项目目录、用同一个 `mgcl.db`，state 就连续。
+4. **mgcl 只做 state 存储**：没有远程运行、变量、策略、团队权限等远程协作功能。
 
 ## 补充：如果用的是 remote backend
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -35,7 +36,7 @@ func (s *Server) createWorkspaceHandler(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Data struct {
 			Attributes struct {
-				Name            string `json:"name"`
+				Name             string `json:"name"`
 				TerraformVersion string `json:"terraform-version"`
 			} `json:"attributes"`
 		} `json:"data"`
@@ -111,21 +112,21 @@ func workspaceJSON(ws *Workspace) map[string]any {
 		"id":   ws.ID,
 		"type": "workspaces",
 		"attributes": map[string]any{
-			"name":             ws.Name,
-			"execution-mode":   ws.ExecutionMode,
+			"name":              ws.Name,
+			"execution-mode":    ws.ExecutionMode,
 			"terraform-version": ws.TerraformVersion,
-			"locked":           ws.Locked,
-			"created-at":       ws.CreatedAt,
+			"locked":            ws.Locked,
+			"created-at":        ws.CreatedAt,
 			"permissions": map[string]bool{
-				"can-lock":          true,
-				"can-unlock":        true,
-				"can-force-unlock":  true,
-				"can-update":        true,
-				"can-destroy":       true,
-				"can-queue-run":     false,
-				"can-queue-apply":   false,
-				"can-queue-destroy": false,
-				"can-read-settings": true,
+				"can-lock":            true,
+				"can-unlock":          true,
+				"can-force-unlock":    true,
+				"can-update":          true,
+				"can-destroy":         true,
+				"can-queue-run":       false,
+				"can-queue-apply":     false,
+				"can-queue-destroy":   false,
+				"can-read-settings":   true,
 				"can-update-variable": true,
 			},
 		},
@@ -183,11 +184,11 @@ func (s *Server) createStateVersionHandler(w http.ResponseWriter, r *http.Reques
 	var body struct {
 		Data struct {
 			Attributes struct {
-				Serial   int    `json:"serial"`
-				Lineage  string `json:"lineage"`
-				MD5      string `json:"md5"`
-				State    string `json:"state"` // base64-encoded, optional
-				Force    bool   `json:"force"`
+				Serial           int    `json:"serial"`
+				Lineage          string `json:"lineage"`
+				MD5              string `json:"md5"`
+				State            string `json:"state"` // base64-encoded, optional
+				Force            bool   `json:"force"`
 				JSONState        string `json:"json-state"`
 				JSONStateOutputs string `json:"json-state-outputs"`
 			} `json:"attributes"`
@@ -214,10 +215,20 @@ func (s *Server) createStateVersionHandler(w http.ResponseWriter, r *http.Reques
 
 	var jsonStateBytes, jsonStateOutputsBytes []byte
 	if attrs.JSONState != "" {
-		jsonStateBytes, _ = base64.StdEncoding.DecodeString(attrs.JSONState)
+		var err error
+		jsonStateBytes, err = base64.StdEncoding.DecodeString(attrs.JSONState)
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "invalid base64 json-state")
+			return
+		}
 	}
 	if attrs.JSONStateOutputs != "" {
-		jsonStateOutputsBytes, _ = base64.StdEncoding.DecodeString(attrs.JSONStateOutputs)
+		var err error
+		jsonStateOutputsBytes, err = base64.StdEncoding.DecodeString(attrs.JSONStateOutputs)
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "invalid base64 json-state-outputs")
+			return
+		}
 	}
 
 	sv, err := s.store.CreateStateVersion(
@@ -316,8 +327,8 @@ func (s *Server) downloadStateHandler(w http.ResponseWriter, r *http.Request) {
 
 func stateVersionJSON(sv *StateVersion, serverURL string) map[string]any {
 	attrs := map[string]any{
-		"serial":   sv.Serial,
-		"status":   sv.Status,
+		"serial":     sv.Serial,
+		"status":     sv.Status,
 		"created-at": sv.CreatedAt,
 	}
 	if sv.Lineage != "" {
@@ -330,8 +341,8 @@ func stateVersionJSON(sv *StateVersion, serverURL string) map[string]any {
 		attrs["hosted-state-download-url"] = fmt.Sprintf("%s/api/v2/state-versions/%s/download", serverURL, sv.ID)
 	}
 	return map[string]any{
-		"id":   sv.ID,
-		"type": "state-versions",
+		"id":         sv.ID,
+		"type":       "state-versions",
 		"attributes": attrs,
 	}
 }
@@ -345,11 +356,12 @@ func handleStoreError(w http.ResponseWriter, err error) {
 		writeAPIError(w, apiErr)
 		return
 	}
-	// Check for unique constraint violations that weren't caught as APIErrors
-	errStr := err.Error()
-	if strings.Contains(errStr, "UNIQUE") {
-		writeError(w, http.StatusConflict, "Conflict", errStr)
+	// Check for unique constraint violations that weren't caught as APIErrors.
+	if strings.Contains(err.Error(), "UNIQUE") {
+		log.Printf("state backend constraint conflict: %v", err)
+		writeError(w, http.StatusConflict, "Conflict", "state backend constraint conflict")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, "Internal Server Error", errStr)
+	log.Printf("state backend error: %v", err)
+	writeError(w, http.StatusInternalServerError, "Internal Server Error", "state backend error")
 }

@@ -8,7 +8,9 @@ OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状�
 
 ## 状态
 
-已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。e2e 覆盖 remote backend、cloud block、lock 冲突和 `mgcl run --`。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
+已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。state、JSON state 和 outputs 在 SQLite 中强制加密；e2e 覆盖 remote backend、cloud block、lock 冲突、`mgcl run --` 和错误私钥被拒绝。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
+
+目标场景是从零启动整套基础设施时的本地手动、交互式 OpenTofu 使用，不以 CI 或无人值守运行为目标。
 
 ## 安装
 
@@ -19,6 +21,26 @@ go build -o mgcl .
 ```
 
 或从 GitHub Releases 下载 `mgcl-linux-amd64` / `mgcl-linux-arm64`。
+
+## 加密私钥
+
+mgcl 强制加密 state，没有明文模式。默认读取 `~/.ssh/id_ed25519`；不存在、权限允许其他用户访问或不是 Ed25519 OpenSSH 私钥时会拒绝启动。
+
+```bash
+ls -l ~/.ssh/id_ed25519
+
+# 没有默认私钥时：
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+
+# 或显式指定另一把私钥：
+mgcl run --encryption-key-file ~/.ssh/mgcl_ed25519 -- ...
+```
+
+私钥受 passphrase 保护时，优先使用 `MGCL_ENCRYPTION_KEY_PASSPHRASE`；未设置时会从 TTY 无回显提示。
+
+> **私钥丢失后，对应的 state 无法恢复。** `mgcl.db` 和私钥要一起备份。加密只保护静态数据库文件，mgcl 运行时会解密 state；它不保护已泄露的数据库副本、正在运行的进程、现有免认证下载端点，也不防能改写数据库的主动攻击者替换密钥元数据。
+
+实现边界见 [docs/state-encryption.md](docs/state-encryption.md)，决策见 [ADR-0004](docs/adr/0004-encrypt-state-by-lineage.md)。
 
 ## 快速开始
 
@@ -102,6 +124,7 @@ tofu apply -auto-approve -input=false
 | `--server`, `-s` | 从 `--host` 推导 | 对外 base URL，用于 discovery 和上传/下载链接 |
 | `--db`, `-d` | `mgcl.db` | SQLite 路径；WAL 模式，会生成 `-wal` / `-shm` |
 | `--token`, `-t` | 空 | Bearer token；为空表示不认证 |
+| `--encryption-key-file` | `~/.ssh/id_ed25519` | 强制加密使用的 Ed25519 OpenSSH 私钥 |
 
 也可以使用 `config.yaml`（搜索 `./config.yaml` 和 `/etc/mgcl/config.yaml`）：
 
@@ -110,9 +133,10 @@ host: "127.0.0.1:1217"
 server: "http://127.0.0.1:1217"
 db: "./mgcl.db"
 token: "dev-token"
+encryption_key_file: "/home/you/.ssh/id_ed25519"
 ```
 
-或环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`。
+或环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`、`MGCL_ENCRYPTION_KEY_FILE`。`MGCL_ENCRYPTION_KEY_PASSPHRASE` 只从环境或 TTY 读取，不能写进配置。
 
 ## 已实现的 API
 
@@ -142,7 +166,11 @@ TACOS `state.v2` 子集：
 - SQLite 单连接，面向本地单用户；不要拿它做多租户服务。
 - 上传/下载 URL 按设计免认证，靠随机 ID 保护；不要暴露到不可信网络。
 - `force` 跳过 serial 单调校验，但仍受 `UNIQUE(workspace_id, serial)` 约束。
-- schema 迁移只有 `CREATE TABLE IF NOT EXISTS`；升级前备份 `mgcl.db`。
+- 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
+- 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
+- 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。
+- 不支持旧明文数据库迁移。遇到既有明文 state 会明确报错，不会静默返回明文；升级前请自行导出或重建数据库。
+- SQLite schema 只做 `CREATE TABLE IF NOT EXISTS`；升级前备份 `mgcl.db`、`-wal`、`-shm` 和私钥。
 
 ## 开发
 

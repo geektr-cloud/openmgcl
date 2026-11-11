@@ -166,6 +166,45 @@ func TestWithEnv(t *testing.T) {
 	}
 }
 
+func TestDropEnv(t *testing.T) {
+	env := []string{"PATH=/usr/bin", passphraseEnv + "=secret", "HOME=/root"}
+	got := dropEnv(env, passphraseEnv)
+	want := []string{"PATH=/usr/bin", "HOME=/root"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestLoadEncryptionIdentity(t *testing.T) {
+	t.Run("unencrypted", func(t *testing.T) {
+		path := writeTestIdentity(t, nil)
+		if _, err := loadEncryptionIdentity(path); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("passphrase from environment", func(t *testing.T) {
+		path := writeTestIdentity(t, []byte("secret"))
+		t.Setenv(passphraseEnv, "secret")
+		if _, err := loadEncryptionIdentity(path); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("wrong passphrase from environment does not prompt", func(t *testing.T) {
+		path := writeTestIdentity(t, []byte("secret"))
+		t.Setenv(passphraseEnv, "wrong")
+		if _, err := loadEncryptionIdentity(path); err == nil {
+			t.Fatal("wrong passphrase succeeded")
+		}
+	})
+}
+
 func TestBuildCLIConfig(t *testing.T) {
 	const (
 		serverURL = "http://127.0.0.1:1217"
@@ -258,7 +297,7 @@ func TestTacosDiscovery(t *testing.T) {
 	defer os.Remove(tmpFile.Name())
 	tmpFile.Close()
 
-	store, err := tacos.Open(tmpFile.Name())
+	store, err := tacos.Open(tmpFile.Name(), testTacosIdentity(t))
 	if err != nil {
 		t.Fatal(err)
 	}

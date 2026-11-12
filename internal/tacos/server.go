@@ -33,7 +33,6 @@ func buildRouter(s *Server) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RealIP)
 	r.Use(apiVersionMiddleware)
-	r.Use(corsMiddleware)
 
 	// Discovery document
 	r.Get("/.well-known/terraform.json", s.discoveryHandler)
@@ -81,20 +80,6 @@ func apiVersionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v2") {
 			w.Header().Set("TFP-API-Version", "2.5")
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// corsMiddleware adds permissive CORS headers for local development.
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
 		}
 		next.ServeHTTP(w, r)
 	})

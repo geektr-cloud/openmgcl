@@ -152,7 +152,11 @@ ECDH 必须处理全零 shared secret 错误，不得忽略。
 
 ## 5. 数据库结构
 
-首版面向新建数据库，不实现旧明文数据迁移。新增表：
+首版面向新建数据库，不实现旧明文数据迁移。v0.1.x 之前不保证历史 schema 兼容，也不提供自动或人工迁移；升级前请自行导出 state。
+
+`state_versions` 不使用表级 `UNIQUE(workspace_id, serial)`，改为 finalized / pending 两个 partial unique index，允许同 serial 的新 pending 与旧 finalized 短暂共存。相关决策见 [ADR-0005](adr/0005-state-version-restore-and-replacement.md)。
+
+新增表：
 
 ```sql
 CREATE TABLE IF NOT EXISTS lineage_keys (
@@ -299,15 +303,20 @@ AAD 不包含 Recipient 或 wrapped-key 元数据，以便未来只 rewrap DEK �
 
 在同一数据库事务中：
 
-1. 要求 `lineage != ""`，否则返回 422；不强制 UUID 格式。
-2. 完成现有 serial/force 校验。
+1. 要求 `lineage != ""` 且 `serial >= 0`，否则返回 422；不强制 UUID 格式。
+2. 处理同 workspace+serial 的既有行：
+   - serial 由客户端生成；正常更新递增，服务端允许更低或相同 serial，以兼容 OpenTofu cloud backend 在 `state push -force` 时清掉 force 的行为。
+   - 相同 serial+lineage+MD5 的 finalized 重复创建一律返回 409，不受 `force` 影响，包括历史 serial，以及已存在同 serial pending 的情况；不同内容可显式 restore 并成为 current。force 不是服务端识别 restore 的依据。
+   - 同 serial 的 pending 可被新请求替换，用于上传失败后的安全重试；已有 finalized 不受影响。该替换发生在 identical finalized 检查之后。
+   - modern create（无 inline state）为不同内容新建 pending，同时保留旧 finalized 作为 current。
+   - inline state 是 finalized 写入，删除同 serial 的旧 pending/finalized 并插入新行在同一事务内原子完成。
 3. 查询 `lineage_keys`：
    - 不存在：生成 DEK、wrap 记录和 lineage 映射；
    - 已存在：读取 wrapped key，验证当前 Recipient 并解出 DEK；失败则整个事务回滚。
 4. 生成 state version ID。
 5. 根据**明文** `len(state) > 0` 决定 pending/finalized，保持原语义。
 6. 对三个非 nil 字段分别加密（包括 non-nil 的零长度值），AAD 使用上述真实 ID 和字段名；nil 字段写 SQL NULL。
-7. 插入 state version、必要的 lineage key 和 wrapped key 后一起提交。
+7. 插入 state version、必要的 lineage key 和 wrapped key 后一起提交。modern pending 不删除旧 finalized；只有上传成功时才在同一事务里删除同 serial 旧 finalized 并 finalize 新行。
 8. 仅在提交成功后把 DEK 放入进程缓存。
 
 串行冲突、唯一约束或加密失败不得留下孤儿 key、pending row 或半加密记录。MD5 继续保存客户端提交的原始 state MD5，不重算为密文 MD5。
@@ -318,17 +327,18 @@ AAD 不包含 Recipient 或 wrapped-key 元数据，以便未来只 rewrap DEK �
 
 pending state version 创建时已经建立 lineage 与 DEK。`UploadState` 和 `UploadJSONState`：
 
-1. 根据 state version ID 读取 workspace ID、lineage 和状态；
-2. 解锁对应 DEK；
-3. 使用 state version ID 和正确字段名加密上传明文；空 body 是 non-nil 零长度输入，也必须写成 envelope；
-4. 更新对应 BLOB；`state` 上传仍负责 finalized，包括空 body 上传；
-5. 无法解锁时不更新任何字节。
+1. 根据 state version ID 读取 workspace ID、serial、lineage、状态和 `rowid`；
+2. pending 版本若已有更晚创建的 finalized 版本，则返回 409，避免过期上传假成功或让 current 倒退；被替换掉的旧 pending URL 因 row 不存在返回 404；
+3. 解锁对应 DEK；
+4. 使用 state version ID 和正确字段名加密上传明文；空 body 是 non-nil 零长度输入，也必须写成 envelope；
+5. `state` 上传 finalize 时，若存在同 workspace+serial 的旧 finalized：lineage+MD5 相同则返回 409（防止遗留 pending 复活历史状态）；不同内容才在同一事务删除旧行，再把 pending 行更新为 finalized，上传失败则事务回滚，旧 current 保持可用；
+6. `json_state` 上传只更新 pending 的 JSON 字段，不改变 current；无法解锁时不更新任何字节。
 
-重复上传会生成新 nonce，这是预期行为，不要求数据库字节幂等。
+重复上传会生成新 nonce，这是预期行为，不要求数据库字节幂等。已 finalized 版本的重复上传维持原有的幂等覆盖行为。
 
 ### 7.3 读取与下载
 
-Store 返回给现有 handler 的 `StateVersion` 仍是明文表示；数据库 row 在持久化边界解密。这样 `downloadStateHandler` 和 JSON:API builder 无需知道加密格式。
+Store 返回给现有 handler 的 `StateVersion` 仍是明文表示；数据库 row 在持久化边界解密。这样 `downloadStateHandler` 和 JSON:API builder 无需知道加密格式。`current-state-version` 按 `rowid DESC` 取最新 finalized 版本；`download` 依据 status 和字段是否存在判断可用性，因此合法 finalized 的空 body 返回 200 和零字节。
 
 每个非 NULL BLOB 的读取顺序固定为：
 
@@ -424,7 +434,7 @@ HKDF、ECDH、AES-GCM 使用 Go 1.25 标准库，不再添加第三套 crypto �
 - 空 lineage 返回 422 且无 key/state 残留；
 - 第二把私钥不能读写既有 lineage，但可以创建和读写新 lineage；
 - 服务/Store 打开含不可解锁 lineage 的 DB 不失败，只有对应操作失败；
-- serial、force、pending/finalized、MD5、lock 行为与加密前一致；
+- serial、current、pending/finalized 替换生命周期、MD5、lock 行为符合 [ADR-0005](adr/0005-state-version-restore-and-replacement.md)；`force` 不绕过 identical finalized 冲突；
 - 事务失败不留下孤儿 key；
 - 旧明文 BLOB 不迁移、不返回，明确报错。
 
@@ -444,7 +454,7 @@ HKDF、ECDH、AES-GCM 使用 Go 1.25 标准库，不再添加第三套 crypto �
 
 编码完成后同步更新：
 
-- `README.md`：强制加密、私钥配置、at-rest 边界、无旧库迁移、私钥丢失风险；
+- `README.md`：强制加密、私钥配置、at-rest 边界、pre-v0.1 无 schema 兼容/迁移承诺、私钥丢失风险；
 - `UserStory.md`：保留最简流程，只补充默认私钥、可选 key-file 和“私钥丢失 = state 不可恢复”；
 - release notes：标明这是破坏数据库格式与启动要求的变化，不要静默作为普通 patch；
 - `--help`：增加 key-file 参数，不增加 passphrase 或关闭加密参数。

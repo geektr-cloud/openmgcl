@@ -443,26 +443,31 @@ func TestSerialConflict(t *testing.T) {
 		t.Errorf("duplicate serial: status = %d, want 409", resp.StatusCode)
 	}
 
-	// serial=3 (less than finalized max of 5) → 409
+	// serial=3 has no existing row: accepted because OpenTofu's cloud backend
+	// clears force before pushing a restore.
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
 			"attributes": map[string]any{"serial": 3, "lineage": "serial-lineage", "state": b64State},
 		},
 	}, "")
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("lower serial: status = %d, want 409", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("lower serial: status = %d, want 201", resp.StatusCode)
 	}
 
-	// force:true bypasses serial check
+	// force:true with different content is a valid restore.
+	restoredState := base64.StdEncoding.EncodeToString([]byte(`{"version":4,"serial":3,"restored":true}`))
 	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/state-versions", ts.URL, wsID), map[string]any{
 		"data": map[string]any{
-			"attributes": map[string]any{"serial": 3, "lineage": "serial-lineage", "state": b64State, "force": true},
+			"attributes": map[string]any{
+				"serial": 3, "lineage": "serial-lineage", "md5": "md5-restored",
+				"state": restoredState, "force": true,
+			},
 		},
 	}, "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		t.Errorf("force serial: status = %d, want 201", resp.StatusCode)
+		t.Errorf("force restore with different content: status = %d, want 201", resp.StatusCode)
 	}
 }
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -12,11 +13,20 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/geektr-cloud/openmgcl/internal/tacos"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+)
+
+const (
+	defaultHost             = "127.0.0.1:1217"
+	defaultDBPath           = "mgcl.db"
+	childGracePeriod        = 10 * time.Second
+	serverShutdownTimeout   = 10 * time.Second
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 2 * time.Minute
 )
 
 var runCmd = &cobra.Command{
@@ -238,113 +248,312 @@ func prepareCLIConfig(serverURL, hostname, token string) (path string, cleanup f
 	return f.Name(), func() { os.Remove(f.Name()) }, nil
 }
 
-func runRun(cmd *cobra.Command, args []string) error {
-	// Manual flag parsing to handle -h for host (conflicts with help)
-	host := "127.0.0.1:1217"
-	serverURL := ""
-	dbPath := "mgcl.db"
-	token := ""
-	encryptionKeyFile := ""
-	var commandArgs []string
+// runOptions is the effective configuration for the run command after parsing
+// flags and merging config/env values.
+type runOptions struct {
+	host              string
+	serverURL         string
+	dbPath            string
+	token             string
+	encryptionKeyFile string
+	command           []string
+	explicit          map[string]bool
+	showVersion       bool
+	showHelp          bool
+}
 
-	i := 0
-	for i < len(args) {
+// parseRunArgs manually parses flags so -h can mean --host instead of help. It
+// records which flags were supplied explicitly; config/env values must not
+// override an explicit flag, including one explicitly set to its default or to
+// an empty string.
+func parseRunArgs(args []string) (*runOptions, error) {
+	opts := &runOptions{
+		host:     defaultHost,
+		dbPath:   defaultDBPath,
+		explicit: make(map[string]bool, 5),
+	}
+
+	for i := 0; i < len(args); {
 		arg := args[i]
-		if arg == "--" {
-			commandArgs = args[i+1:]
-			break
-		} else if arg == "--host" || arg == "-h" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("flag %s requires a value", arg)
+		switch arg {
+		case "--":
+			opts.command = args[i+1:]
+			return opts, nil
+		case "--host", "-h":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
 			}
-			host = args[i+1]
-			i += 2
-		} else if arg == "--server" || arg == "-s" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("flag %s requires a value", arg)
+			opts.host = value
+			opts.explicit["host"] = true
+			i = next
+		case "--server", "-s":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
 			}
-			serverURL = args[i+1]
-			i += 2
-		} else if arg == "--db" || arg == "-d" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("flag %s requires a value", arg)
+			opts.serverURL = value
+			opts.explicit["server"] = true
+			i = next
+		case "--db", "-d":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
 			}
-			dbPath = args[i+1]
-			i += 2
-		} else if arg == "--token" || arg == "-t" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("flag %s requires a value", arg)
+			opts.dbPath = value
+			opts.explicit["db"] = true
+			i = next
+		case "--token", "-t":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
 			}
-			token = args[i+1]
-			i += 2
-		} else if arg == "--encryption-key-file" {
-			if i+1 >= len(args) {
-				return fmt.Errorf("flag %s requires a value", arg)
+			opts.token = value
+			opts.explicit["token"] = true
+			i = next
+		case "--encryption-key-file":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
 			}
-			encryptionKeyFile = args[i+1]
-			i += 2
-		} else if arg == "--version" {
-			fmt.Printf("mgcl %s\n", version)
-			return nil
-		} else if arg == "--help" {
-			fmt.Print(cmd.Long)
-			return nil
-		} else {
-			return fmt.Errorf("unknown flag: %s", arg)
+			opts.encryptionKeyFile = value
+			opts.explicit["encryption_key_file"] = true
+			i = next
+		case "--version":
+			opts.showVersion = true
+			return opts, nil
+		case "--help":
+			opts.showHelp = true
+			return opts, nil
+		default:
+			return nil, fmt.Errorf("unknown flag: %s", arg)
 		}
 	}
+	return opts, nil
+}
 
-	// Check config file values
-	if host == "127.0.0.1:1217" && viper.GetString("host") != "" {
-		host = viper.GetString("host")
+func nextFlagValue(args []string, i int, flag string) (string, int, error) {
+	if i+1 >= len(args) {
+		return "", 0, fmt.Errorf("flag %s requires a value", flag)
 	}
-	if serverURL == "" && viper.GetString("server") != "" {
-		serverURL = viper.GetString("server")
+	return args[i+1], i + 2, nil
+}
+
+// applyConfig fills values that were not supplied on the command line. An
+// explicit flag always wins, even when it equals the default value or is empty.
+func (opts *runOptions) applyConfig(config *viper.Viper) {
+	if !opts.explicit["host"] {
+		if value := config.GetString("host"); value != "" {
+			opts.host = value
+		}
 	}
-	if dbPath == "mgcl.db" && viper.GetString("db") != "" {
-		dbPath = viper.GetString("db")
+	if !opts.explicit["server"] {
+		if value := config.GetString("server"); value != "" {
+			opts.serverURL = value
+		}
 	}
-	if token == "" && viper.GetString("token") != "" {
-		token = viper.GetString("token")
+	if !opts.explicit["db"] {
+		if value := config.GetString("db"); value != "" {
+			opts.dbPath = value
+		}
 	}
-	if encryptionKeyFile == "" && viper.GetString("encryption_key_file") != "" {
-		encryptionKeyFile = viper.GetString("encryption_key_file")
+	if !opts.explicit["token"] {
+		if value := config.GetString("token"); value != "" {
+			opts.token = value
+		}
 	}
-	if encryptionKeyFile == "" {
+	if !opts.explicit["encryption_key_file"] {
+		if value := config.GetString("encryption_key_file"); value != "" {
+			opts.encryptionKeyFile = value
+		}
+	}
+}
+
+// exitCodeError carries a process exit code through Cobra without being printed
+// as an error. main uses ExitCode after all defers have run.
+type exitCodeError struct {
+	code int
+}
+
+func (e *exitCodeError) Error() string { return fmt.Sprintf("exit status %d", e.code) }
+
+func (e *exitCodeError) ExitCode() int { return e.code }
+
+// shutdownServer gracefully stops the HTTP server within a bounded window,
+// falling back to Close when handlers do not finish in time.
+func shutdownServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+	}
+}
+
+// childExitCode converts a command wait error into an exit code. Non-ExitError
+// failures are returned as errors; signal termination becomes 128+signal.
+func childExitCode(err error) (int, error) {
+	if err == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return processExitCode(exitErr.ProcessState), nil
+	}
+	return 0, err
+}
+
+// runChildProcess starts child in its own process group and waits for it. On
+// SIGINT/SIGTERM the signal is forwarded to the whole group, a bounded grace
+// period is allowed, and the group is killed if it does not exit. A second
+// signal forces the group down immediately.
+func runChildProcess(child *exec.Cmd, sigCh <-chan os.Signal) (int, error) {
+	configureChildProcess(child)
+
+	if err := child.Start(); err != nil {
+		return 0, err
+	}
+	// Hand the controlling terminal to the child's process group so interactive
+	// commands (tofu prompts, read, ...) can read stdin instead of receiving
+	// SIGTTIN. The parent restores the terminal when the child finishes.
+	restoreTerminal := handoffTerminalToChild(child)
+	defer restoreTerminal()
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- child.Wait()
+	}()
+
+	select {
+	case err := <-waitCh:
+		// Prefer an already-pending shutdown signal over the child's own exit
+		// status so a signal delivered around the same time always maps to
+		// 128+signal.
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
+			return signalExitCode(sig), nil
+		default:
+		}
+		return childExitCode(err)
+	case sig := <-sigCh:
+		fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
+		forwardSignal(child, sig)
+		return finishChildAfterSignal(child, waitCh, sigCh, sig), nil
+	}
+}
+
+func finishChildAfterSignal(child *exec.Cmd, waitCh <-chan error, sigCh <-chan os.Signal, sig os.Signal) int {
+	exitCode := signalExitCode(sig)
+	grace := time.NewTimer(childGracePeriod)
+	defer grace.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	childDone := false
+	for {
+		select {
+		case <-waitCh:
+			childDone = true
+			waitCh = nil
+			// The direct child is gone; wait for any remaining group members
+			// until the grace period expires.
+			reapAdoptedChildren()
+			if !processGroupAlive(child) {
+				return exitCode
+			}
+		case <-ticker.C:
+			if childDone {
+				reapAdoptedChildren()
+				if !processGroupAlive(child) {
+					return exitCode
+				}
+			}
+		case second := <-sigCh:
+			fmt.Fprintf(os.Stderr, "\nReceived %v, forcing shutdown...\n", second)
+			killChildProcessGroup(child)
+			if !childDone {
+				<-waitCh
+			}
+			return exitCode
+		case <-grace.C:
+			killChildProcessGroup(child)
+			if !childDone {
+				<-waitCh
+			}
+			return exitCode
+		}
+	}
+}
+
+func runRun(cmd *cobra.Command, args []string) error {
+	opts, err := parseRunArgs(args)
+	if err != nil {
+		return err
+	}
+	if opts.showVersion {
+		fmt.Printf("mgcl %s\n", version)
+		return nil
+	}
+	if opts.showHelp {
+		fmt.Print(cmd.Long)
+		return nil
+	}
+
+	// Load config before touching the key, database, or listener so malformed
+	// config fails the command instead of silently running with defaults.
+	config, err := newConfig()
+	if err != nil {
+		return err
+	}
+	opts.applyConfig(config)
+
+	if opts.encryptionKeyFile == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fmt.Errorf("resolve home directory for encryption key: %w", err)
 		}
-		encryptionKeyFile = filepath.Join(home, ".ssh", "id_ed25519")
+		opts.encryptionKeyFile = filepath.Join(home, ".ssh", "id_ed25519")
 	}
 
-	identity, err := loadEncryptionIdentity(encryptionKeyFile)
+	identity, err := loadEncryptionIdentity(opts.encryptionKeyFile)
 	if err != nil {
 		return fmt.Errorf("load encryption key: %w", err)
 	}
 
 	// Open the TACOS store
-	store, err := tacos.Open(dbPath, identity)
+	store, err := tacos.Open(opts.dbPath, identity)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer store.Close()
 
 	// Start HTTP server
-	listener, err := net.Listen("tcp", host)
+	listener, err := net.Listen("tcp", opts.host)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", host, err)
+		return fmt.Errorf("failed to listen on %s: %w", opts.host, err)
 	}
 
 	// Derive server URL using actual listener address (handles port 0)
-	serverURL, err = deriveServerURL(host, listener.Addr(), serverURL)
+	serverURL, err := deriveServerURL(opts.host, listener.Addr(), opts.serverURL)
 	if err != nil {
 		listener.Close()
 		return fmt.Errorf("derive server URL: %w", err)
 	}
 
-	handler := tacos.NewRouter(store, serverURL, token)
-	server := &http.Server{Handler: handler}
+	handler := tacos.NewRouter(store, serverURL, opts.token)
+	server := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
+	// Every exit path shuts the server down before the deferred store.Close.
+	defer shutdownServer(server)
+
+	// Register signal handling before announcing readiness so a signal sent
+	// immediately after the listening line cannot bypass cleanup.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, shutdownSignals...)
+	defer signal.Stop(sigCh)
 
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -355,64 +564,37 @@ func runRun(cmd *cobra.Command, args []string) error {
 	// Server is ready since listener is already bound
 	fmt.Fprintf(os.Stderr, "MgCl server listening on %s\n", listener.Addr())
 
-	if len(commandArgs) == 0 {
+	if len(opts.command) == 0 {
 		// No command - wait for signal
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
 		fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
-		server.Shutdown(context.Background())
-		return nil
+		return &exitCodeError{code: signalExitCode(sig)}
 	}
-
-	// Run the command
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	execCmd := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
-	execCmd.Stdin = os.Stdin
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
 
 	// Point OpenTofu at the local server. TF_CLOUD_HOSTNAME must be host[:port];
 	// TF_CLI_CONFIG_FILE carries the http service URLs and credentials.
 	hostname := hostFromServerURL(serverURL)
-	cliConfigPath, cleanupConfig, err := prepareCLIConfig(serverURL, hostname, token)
+	cliConfigPath, cleanupConfig, err := prepareCLIConfig(serverURL, hostname, opts.token)
 	if err != nil {
-		server.Shutdown(context.Background())
 		return err
 	}
 	defer cleanupConfig()
 
-	execCmd.Env = withEnv(dropEnv(os.Environ(), passphraseEnv),
+	child := exec.Command(opts.command[0], opts.command[1:]...)
+	child.Stdin = os.Stdin
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.Env = withEnv(dropEnv(os.Environ(), passphraseEnv),
 		"TF_CLOUD_HOSTNAME="+hostname,
 		"TF_CLI_CONFIG_FILE="+cliConfigPath,
 	)
 
-	// Handle signals during command execution
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- execCmd.Run()
-	}()
-
-	select {
-	case sig := <-sigCh:
-		fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
-		cancel()
-		<-errCh // Wait for command to exit
-		server.Shutdown(context.Background())
-		return fmt.Errorf("terminated by signal")
-	case err := <-errCh:
-		server.Shutdown(context.Background())
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			return err
-		}
-		return nil
+	exitCode, err := runChildProcess(child, sigCh)
+	if err != nil {
+		return err
 	}
+	if exitCode != 0 {
+		return &exitCodeError{code: exitCode}
+	}
+	return nil
 }

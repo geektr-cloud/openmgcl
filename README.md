@@ -64,7 +64,7 @@ mgcl run --db ./mgcl.db --token dev-token -- \
   sh -c 'tofu init -input=false && tofu apply -auto-approve -input=false'
 ```
 
-`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程，命令结束后关闭服务。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。
+`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程，命令结束后关闭服务。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。子进程退出码原样作为 `mgcl` 退出码；被信号终止时为 `128+signal`。
 
 如果使用 `remote` backend，OpenTofu 要求显式 `hostname`：
 
@@ -138,6 +138,8 @@ encryption_key_file: "/home/you/.ssh/id_ed25519"
 
 或环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`、`MGCL_ENCRYPTION_KEY_FILE`。`MGCL_ENCRYPTION_KEY_PASSPHRASE` 只从环境或 TTY 读取，不能写进配置。
 
+配置优先级：显式 flag（包括空串或显式设为默认值）> `MGCL_*` 环境变量 > `./config.yaml` > `/etc/mgcl/config.yaml` > 内置默认值。
+
 ## 已实现的 API
 
 TACOS `state.v2` 子集：
@@ -165,12 +167,16 @@ TACOS `state.v2` 子集：
 - discovery 同时通告 `state.v2`、`tfe.v2`、`tfe.v2.1`，原因见 [ADR-0001](docs/adr/0001-advertise-service-ids-beyond-implemented-scope.md)。未实现的端点会返回 404。
 - SQLite 单连接，面向本地单用户；不要拿它做多租户服务。
 - 上传/下载 URL 按设计免认证，靠随机 ID 保护；不要暴露到不可信网络。
-- `force` 跳过 serial 单调校验，但仍受 `UNIQUE(workspace_id, serial)` 约束。
+- API 不发送 CORS 头，浏览器页面不能跨源读取 state；OpenTofu CLI 不需要 CORS。
+- serial 由客户端生成：正常更新递增，服务端也允许更低或相同 serial。`current-state-version` 按创建顺序返回最新 finalized 版本，不用 `MAX(serial)`。任何更晚创建的 finalized 版本都会使旧 pending 变成 stale。
+- modern create 的 pending 与同 serial 旧 finalized 可共存：上传成功前 current/download 仍是旧版本，成功后同一事务删除旧 finalized 并 finalize 新行；上传失败或放弃不影响旧 current。替换成功后旧 URL 返回 404。设计见 [ADR-0005](docs/adr/0005-state-version-restore-and-replacement.md)。
+- 相同 serial、lineage 和 MD5 的 finalized 重复创建一律返回 409，即使 `force=true` 或已有同 serial pending 也不会替换；upload finalize 对这种 pending 同样返回 409。不同内容的显式 restore 可以成为 current。pending 可同 serial 重试并替换旧上传 URL；pending 在更新版本 finalized 后视为过期，其上传返回 409。
+- `state_versions` 没有表级 `UNIQUE(workspace_id, serial)`；finalized 与 pending 各有一个同列 partial unique index。v0.1.x 之前不保证历史 schema 兼容，也不提供自动或人工迁移；升级前建议备份 `mgcl.db`、`-wal`、`-shm` 和私钥，必要时自行导出 state。
+- 上传 raw state / JSON state 上限约 100MiB；含 base64 inline state 的 create 请求留有 base64 余量；workspace 和 lock 请求上限 1MiB；超限返回 413。
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
 - 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。
-- 不支持旧明文数据库迁移。遇到既有明文 state 会明确报错，不会静默返回明文；升级前请自行导出或重建数据库。
-- SQLite schema 只做 `CREATE TABLE IF NOT EXISTS`；升级前备份 `mgcl.db`、`-wal`、`-shm` 和私钥。
+- 不支持旧明文数据库迁移。遇到既有明文 state 会明确报错，不会静默返回明文。
 
 ## 开发
 

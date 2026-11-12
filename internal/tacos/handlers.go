@@ -3,6 +3,7 @@ package tacos
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,8 +42,7 @@ func (s *Server) createWorkspaceHandler(w http.ResponseWriter, r *http.Request) 
 			} `json:"attributes"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
+	if !decodeJSONBody(w, r, maxWorkspaceBodySize, &body) {
 		return
 	}
 	if body.Data.Attributes.Name == "" {
@@ -67,7 +67,10 @@ func (s *Server) listWorkspacesHandler(w http.ResponseWriter, r *http.Request) {
 		page = 1
 	}
 	if pageSize < 1 {
-		pageSize = 100
+		pageSize = maxPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
 	}
 
 	wss, total, err := s.store.ListWorkspaces(org, namePrefix, page, pageSize)
@@ -143,7 +146,9 @@ func (s *Server) lockWorkspaceHandler(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Reason string `json:"reason"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if !decodeOptionalJSONBody(w, r, maxLockBodySize, &body) {
+		return
+	}
 
 	if err := s.store.LockWorkspace(id, body.Reason); err != nil {
 		handleStoreError(w, err)
@@ -195,8 +200,7 @@ func (s *Server) createStateVersionHandler(w http.ResponseWriter, r *http.Reques
 			Relationships map[string]any `json:"relationships"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
+	if !decodeJSONBody(w, r, maxStateVersionCreateBodySize, &body) {
 		return
 	}
 
@@ -229,6 +233,12 @@ func (s *Server) createStateVersionHandler(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "invalid base64 json-state-outputs")
 			return
 		}
+	}
+	if int64(len(stateBytes)) > maxStateUploadBytes ||
+		int64(len(jsonStateBytes)) > maxStateUploadBytes ||
+		int64(len(jsonStateOutputsBytes)) > maxStateUploadBytes {
+		writeBodyTooLarge(w)
+		return
 	}
 
 	sv, err := s.store.CreateStateVersion(
@@ -280,9 +290,8 @@ func (s *Server) getStateVersionHandler(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) uploadStateHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "Bad Request", "failed to read body")
+	data, ok := readBody(w, r, maxStateUploadBytes)
+	if !ok {
 		return
 	}
 	if err := s.store.UploadState(id, data); err != nil {
@@ -294,9 +303,8 @@ func (s *Server) uploadStateHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) uploadJSONStateHandler(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "Bad Request", "failed to read body")
+	data, ok := readBody(w, r, maxStateUploadBytes)
+	if !ok {
 		return
 	}
 	if err := s.store.UploadJSONState(id, data); err != nil {
@@ -313,7 +321,7 @@ func (s *Server) downloadStateHandler(w http.ResponseWriter, r *http.Request) {
 		handleStoreError(w, err)
 		return
 	}
-	if sv.Status != "finalized" || len(sv.State) == 0 {
+	if sv.Status != "finalized" || !sv.StatePresent {
 		writeError(w, http.StatusNotFound, "Not Found", "state not available")
 		return
 	}
@@ -345,6 +353,73 @@ func stateVersionJSON(sv *StateVersion, serverURL string) map[string]any {
 		"type":       "state-versions",
 		"attributes": attrs,
 	}
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Body limits
+// ──────────────────────────────────────────────────────────────────────────────
+
+// limitRequestBody caps how many bytes handlers will read from the request.
+func limitRequestBody(w http.ResponseWriter, r *http.Request, limit int64) {
+	if r.Body == nil {
+		r.Body = http.NoBody
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+}
+
+func isBodyTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.As(err, &maxErr)
+}
+
+func writeBodyTooLarge(w http.ResponseWriter) {
+	writeError(w, http.StatusRequestEntityTooLarge, "Request Entity Too Large", "request body too large")
+}
+
+// readBody reads a bounded request body, writing 413 or 400 itself.
+func readBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	limitRequestBody(w, r, limit)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeBodyTooLarge(w)
+		} else {
+			writeError(w, http.StatusBadRequest, "Bad Request", "failed to read body")
+		}
+		return nil, false
+	}
+	return data, true
+}
+
+// decodeJSONBody decodes a bounded JSON request body.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, limit int64, dst any) bool {
+	limitRequestBody(w, r, limit)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		if isBodyTooLarge(err) {
+			writeBodyTooLarge(w)
+		} else {
+			writeError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
+		}
+		return false
+	}
+	return true
+}
+
+// decodeOptionalJSONBody accepts an empty body as an empty object but still
+// rejects malformed JSON.
+func decodeOptionalJSONBody(w http.ResponseWriter, r *http.Request, limit int64, dst any) bool {
+	limitRequestBody(w, r, limit)
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err == nil || errors.Is(err, io.EOF) {
+		return true
+	}
+	if isBodyTooLarge(err) {
+		writeBodyTooLarge(w)
+	} else {
+		writeError(w, http.StatusBadRequest, "Bad Request", "invalid JSON body")
+	}
+	return false
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

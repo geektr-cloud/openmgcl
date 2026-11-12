@@ -283,9 +283,9 @@ func TestStoreFailedStateInsertLeavesNoKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := store.CreateStateVersion(ws.ID, 1, "second-lineage", "", []byte(`{}`), nil, nil, true)
-	if !IsAPIError(err, http.StatusConflict) {
-		t.Fatalf("serial conflict error = %v, want 409", err)
+	_, err := store.CreateStateVersion("ws-missing", 1, "second-lineage", "", []byte(`{}`), nil, nil, true)
+	if !IsAPIError(err, http.StatusNotFound) {
+		t.Fatalf("missing workspace error = %v, want 404", err)
 	}
 	var lineageCount, wrappedCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM lineage_keys WHERE lineage = 'second-lineage'`).Scan(&lineageCount); err != nil {

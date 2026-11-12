@@ -138,6 +138,9 @@ func validateWrappedKeyRecord(record *wrappedKeyRecord) ([sha256.Size]byte, erro
 	if err != nil {
 		return fingerprint, fmt.Errorf("invalid wrapped lineage key fingerprint: %w", err)
 	}
+	if _, err := parseKeyFingerprint(record.RecipientFingerprint); err != nil {
+		return fingerprint, errors.New("invalid wrapped lineage key recipient fingerprint")
+	}
 	return fingerprint, nil
 }
 

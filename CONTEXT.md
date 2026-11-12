@@ -28,11 +28,15 @@ organization 下的具名状态容器。本项目一律为 local 执行模式，
 _Avoid_: project, environment
 
 **State version**:
-workspace 内一份 state 快照记录，携带 serial、lineage 与状态字节。
+workspace 内一份 state 快照记录，携带 serial、lineage 与状态字节，生命周期为 pending 或 finalized。
 _Avoid_: state file, snapshot
 
+**Current state version**:
+workspace 中按创建顺序最新的 finalized 版本；current-state-version 与下载指向它。
+_Avoid_: latest serial, head
+
 **Serial**:
-workspace 内单调递增的 state version 序号，客户端递增、服务端强制（除非 force push）。
+由客户端生成、正常更新时递增的 state version 序号。服务端允许更低或相同 serial；current 取决于 finalized 版本的创建顺序，而不是最大 serial。
 
 **State Lineage**:
 标识一族 state 的不透明标识（通常为 UUID），由客户端生成与管理。正常更新保持不变；保留 lineage 的迁移或副本属于同一族，并共享加密密钥。
@@ -53,13 +57,23 @@ Recipient 的 Ed25519 公钥指纹，用于选择对应的私钥。
 _Avoid_: key fingerprint
 
 **Pending / Finalized**:
-state version 的两个生命周期状态：已创建但状态字节未到（pending），状态字节已落库可下载（finalized）。
+state version 的两个生命周期状态：已创建但状态字节未到（pending），状态字节已落库可下载（finalized）。同 serial 的新 pending 可与旧 finalized 共存，旧 finalized 在替换上传成功前仍是 current。
+
+**Stale pending**:
+已被更晚创建的 finalized 版本覆盖的 pending。其上传被拒绝，不能改变 current。
+
+**State version replacement**:
+同 workspace+serial 用新版本替换旧 finalized。modern 流程先创建 pending，旧 finalized 保持 current；上传成功后原子替换。
+
+**Restore**:
+用不同内容的 state 创建 replacement，使 current 回到该内容。restore 可由普通更新或 force push 触发；服务端按请求内容与冲突规则判断。
+_Avoid_: rollback, force push（force push 是客户端选项）
 
 **Foreign upload / download**:
 客户端对服务端签发的上传/下载 URL 发起的原始字节请求（`application/octet-stream`），不携带 Bearer 凭据。
 
 **Force push**:
-创建 state version 时跳过 serial 单调校验的强制写入标志。
+OpenTofu `state push -force` 的客户端意图，用于跳过客户端本地 lineage/serial 检查。服务端不把该标志当作 restore 依据，也不允许它绕过 identical finalized 冲突；force unlock 是另一种锁操作。
 _Avoid_: overwrite, force unlock（后者是锁操作）
 
 **Lock**:

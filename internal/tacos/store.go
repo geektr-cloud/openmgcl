@@ -30,7 +30,7 @@ func Open(path string, identity *Identity) (*Store, error) {
 		return nil, errors.New("encryption identity is required")
 	}
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -52,6 +52,12 @@ func Open(path string, identity *Identity) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func migrate(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	defer tx.Rollback()
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS workspaces (
 			id TEXT PRIMARY KEY,
@@ -74,9 +80,12 @@ func migrate(db *sql.DB) error {
 			json_state BLOB,
 			json_state_outputs BLOB,
 			status TEXT NOT NULL DEFAULT 'pending',
-			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-			UNIQUE(workspace_id, serial)
+			created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_state_versions_finalized_workspace_serial
+			ON state_versions(workspace_id, serial) WHERE status = 'finalized'`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_state_versions_pending_workspace_serial
+			ON state_versions(workspace_id, serial) WHERE status = 'pending'`,
 		`CREATE TABLE IF NOT EXISTS lineage_keys (
 			lineage TEXT PRIMARY KEY,
 			key_fingerprint TEXT NOT NULL UNIQUE,
@@ -96,9 +105,12 @@ func migrate(db *sql.DB) error {
 			ON wrapped_lineage_keys(recipient_fingerprint)`,
 	}
 	for _, s := range stmts {
-		if _, err := db.Exec(s); err != nil {
+		if _, err := tx.Exec(s); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 	return nil
 }
@@ -171,7 +183,10 @@ func (s *Store) ListWorkspaces(org, namePrefix string, page, pageSize int) ([]Wo
 		page = 1
 	}
 	if pageSize < 1 {
-		pageSize = 100
+		pageSize = maxPageSize
+	}
+	if pageSize > maxPageSize {
+		pageSize = maxPageSize
 	}
 
 	var args []any
@@ -299,6 +314,9 @@ type StateVersion struct {
 	JSONStateOutputs []byte
 	Status           string
 	CreatedAt        string
+	StatePresent     bool
+	JSONStatePresent bool
+	OutputsPresent   bool
 }
 
 // GetMaxFinalizedSerial returns the highest finalized serial for the workspace, or -1 if none.
@@ -316,12 +334,20 @@ func (s *Store) GetMaxFinalizedSerial(wsID string) (int, error) {
 	return int(v.Int64), nil
 }
 
-// CreateStateVersion inserts a new state version row. If force is false it
-// validates serial > max finalized serial. Returns the generated ID.
-// state may be nil (modern upload path) or populated (fallback inline path).
-func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string, state, jsonState, jsonStateOutputs []byte, force bool) (*StateVersion, error) {
+// CreateStateVersion inserts a new state version row. serial is client
+// generated: normal updates advance it, but lower or equal serials are accepted
+// for restore compatibility. An identical finalized retransmit returns a
+// conflict regardless of the client's force flag. state may be nil (modern
+// upload path) or populated (fallback inline path).
+//
+// The final bool parameter is retained for call-site compatibility. The
+// server does not trust force and it does not bypass any validation.
+func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string, state, jsonState, jsonStateOutputs []byte, _ bool) (*StateVersion, error) {
 	if lineage == "" {
 		return nil, ErrUnprocessable("lineage is required")
+	}
+	if serial < 0 {
+		return nil, ErrUnprocessable("serial must be non-negative")
 	}
 
 	tx, err := s.db.Begin()
@@ -330,21 +356,67 @@ func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string,
 	}
 	defer tx.Rollback()
 
-	if !force {
-		maxSer, err := s.getMaxFinalizedSerialTx(tx, wsID)
-		if err != nil {
-			return nil, err
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM workspaces WHERE id = ?`, wsID).Scan(&exists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound("workspace not found")
 		}
-		if serial <= maxSer {
-			return nil, ErrConflict(fmt.Sprintf("serial %d <= current max finalized %d", serial, maxSer))
-		}
+		return nil, err
 	}
 
-	id := randomID("sv")
 	status := "pending"
 	if len(state) > 0 {
 		status = "finalized"
 	}
+
+	var pendingID string
+	err = tx.QueryRow(
+		`SELECT id FROM state_versions WHERE workspace_id = ? AND serial = ? AND status = 'pending'`,
+		wsID, serial,
+	).Scan(&pendingID)
+	hasPending := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	var finalizedID, finalizedLineage, finalizedMD5 string
+	err = tx.QueryRow(
+		`SELECT id, COALESCE(lineage,''), COALESCE(md5,'')
+		FROM state_versions WHERE workspace_id = ? AND serial = ? AND status = 'finalized'`,
+		wsID, serial,
+	).Scan(&finalizedID, &finalizedLineage, &finalizedMD5)
+	hasFinalized := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	switch {
+	case hasFinalized && finalizedLineage == lineage && finalizedMD5 == md5:
+		// Identical finalized retransmit, including historical serials after
+		// a restore and even when a same-serial pending row exists. force is
+		// not trusted, so this applies to force requests too.
+		return nil, ErrConflict(fmt.Sprintf("serial %d already exists for workspace", serial))
+	case status == "pending" && hasPending:
+		// Safe retry: replace the pending row, never the finalized version
+		// that is still serving current/download.
+		if _, err := tx.Exec(`DELETE FROM state_versions WHERE id = ?`, pendingID); err != nil {
+			return nil, err
+		}
+	case status == "finalized":
+		// Inline state carries the payload, so the replacement is atomic.
+		if hasPending {
+			if _, err := tx.Exec(`DELETE FROM state_versions WHERE id = ?`, pendingID); err != nil {
+				return nil, err
+			}
+		}
+		if hasFinalized {
+			if _, err := tx.Exec(`DELETE FROM state_versions WHERE id = ?`, finalizedID); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	id := randomID("sv")
 
 	dek, fingerprint, err := s.lineageKeyTx(tx, lineage, true)
 	if err != nil {
@@ -374,11 +446,33 @@ func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string,
 		}
 		return nil, err
 	}
+	var createdAt string
+	if err := tx.QueryRow(`SELECT created_at FROM state_versions WHERE id = ?`, id).Scan(&createdAt); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	s.cacheKey(fingerprint, dek)
-	return s.GetStateVersion(id)
+
+	// Return the row from this transaction rather than re-reading it: another
+	// concurrent same-serial retry may replace this pending row immediately
+	// after commit.
+	return &StateVersion{
+		ID:               id,
+		WorkspaceID:      wsID,
+		Serial:           serial,
+		Lineage:          lineage,
+		MD5:              md5,
+		State:            state,
+		JSONState:        jsonState,
+		JSONStateOutputs: jsonStateOutputs,
+		Status:           status,
+		CreatedAt:        createdAt,
+		StatePresent:     state != nil,
+		JSONStatePresent: jsonState != nil,
+		OutputsPresent:   jsonStateOutputs != nil,
+	}, nil
 }
 
 func sealOptional(dek []byte, fingerprint, wsID, svID, lineage, fieldName string, data []byte) ([]byte, error) {
@@ -476,20 +570,6 @@ func (s *Store) cachedKey(fingerprint string) ([]byte, bool) {
 	return append([]byte(nil), dek...), true
 }
 
-func (s *Store) getMaxFinalizedSerialTx(tx *sql.Tx, wsID string) (int, error) {
-	var v sql.NullInt64
-	err := tx.QueryRow(
-		`SELECT MAX(serial) FROM state_versions WHERE workspace_id = ? AND status = 'finalized'`, wsID,
-	).Scan(&v)
-	if err != nil {
-		return -1, err
-	}
-	if !v.Valid {
-		return -1, nil
-	}
-	return int(v.Int64), nil
-}
-
 // GetStateVersion returns a state version by ID.
 func (s *Store) GetStateVersion(id string) (*StateVersion, error) {
 	row := s.db.QueryRow(
@@ -499,13 +579,15 @@ func (s *Store) GetStateVersion(id string) (*StateVersion, error) {
 	return s.scanStateVersion(row)
 }
 
-// GetCurrentStateVersion returns the latest finalized state version for a workspace.
+// GetCurrentStateVersion returns the most recently created finalized state
+// version for a workspace. A restore may lower the serial, so insertion order
+// (rowid) is authoritative rather than MAX(serial).
 func (s *Store) GetCurrentStateVersion(wsID string) (*StateVersion, error) {
 	row := s.db.QueryRow(
 		`SELECT id, workspace_id, serial, COALESCE(lineage,''), COALESCE(md5,''), state, json_state, json_state_outputs, status, created_at,
 			state IS NOT NULL, json_state IS NOT NULL, json_state_outputs IS NOT NULL
 		FROM state_versions WHERE workspace_id = ? AND status = 'finalized'
-		ORDER BY serial DESC LIMIT 1`, wsID)
+		ORDER BY rowid DESC LIMIT 1`, wsID)
 	sv, err := s.scanStateVersion(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -533,10 +615,13 @@ func (s *Store) uploadStateField(id, fieldName string, data []byte, finalize boo
 	}
 	defer tx.Rollback()
 
-	var wsID, lineage string
+	var rowID int64
+	var wsID, lineage, md5, status string
+	var serial int
 	if err := tx.QueryRow(
-		`SELECT workspace_id, COALESCE(lineage,'') FROM state_versions WHERE id = ?`, id,
-	).Scan(&wsID, &lineage); err != nil {
+		`SELECT rowid, workspace_id, COALESCE(lineage,''), COALESCE(md5,''), status, serial
+		FROM state_versions WHERE id = ?`, id,
+	).Scan(&rowID, &wsID, &lineage, &md5, &status, &serial); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound("state version not found")
 		}
@@ -544,6 +629,20 @@ func (s *Store) uploadStateField(id, fieldName string, data []byte, finalize boo
 	}
 	if lineage == "" {
 		return errors.New("state version has no lineage")
+	}
+	if status == "pending" {
+		var newerFinalized int
+		if err := tx.QueryRow(
+			`SELECT EXISTS(
+				SELECT 1 FROM state_versions
+				WHERE workspace_id = ? AND status = 'finalized' AND rowid > ?
+			)`, wsID, rowID,
+		).Scan(&newerFinalized); err != nil {
+			return err
+		}
+		if newerFinalized != 0 {
+			return ErrConflict("state version upload is stale")
+		}
 	}
 
 	dek, fingerprint, err := s.lineageKeyTx(tx, lineage, false)
@@ -557,6 +656,35 @@ func (s *Store) uploadStateField(id, fieldName string, data []byte, finalize boo
 
 	var res sql.Result
 	if finalize {
+		if status == "pending" {
+			// Defense for pending rows created before the identical-finalized
+			// check existed (or by an older database): never finalize an
+			// identical retransmit of the version it would replace.
+			var finalizedLineage, finalizedMD5 string
+			err := tx.QueryRow(
+				`SELECT COALESCE(lineage,''), COALESCE(md5,'')
+				FROM state_versions
+				WHERE workspace_id = ? AND serial = ? AND status = 'finalized'`,
+				wsID, serial,
+			).Scan(&finalizedLineage, &finalizedMD5)
+			switch {
+			case err == nil && finalizedLineage == lineage && finalizedMD5 == md5:
+				return ErrConflict("state version upload is an identical finalized retransmit")
+			case err == nil, errors.Is(err, sql.ErrNoRows):
+			default:
+				return err
+			}
+
+			// The old finalized version stays current until this upload
+			// succeeds. Replace it atomically with the new finalized row.
+			if _, err := tx.Exec(
+				`DELETE FROM state_versions
+				WHERE workspace_id = ? AND serial = ? AND status = 'finalized' AND id != ?`,
+				wsID, serial, id,
+			); err != nil {
+				return err
+			}
+		}
 		res, err = tx.Exec(
 			`UPDATE state_versions SET state = ?, status = 'finalized' WHERE id = ?`, encrypted, id)
 	} else {
@@ -595,6 +723,9 @@ func (s *Store) scanStateVersion(row *sql.Row) (*StateVersion, error) {
 		outputsPresent && len(sv.JSONStateOutputs) == 0 {
 		return nil, errors.New("invalid encrypted state envelope")
 	}
+	sv.StatePresent = statePresent
+	sv.JSONStatePresent = jsonStatePresent
+	sv.OutputsPresent = outputsPresent
 	if err := s.decryptStateVersion(&sv); err != nil {
 		return nil, err
 	}

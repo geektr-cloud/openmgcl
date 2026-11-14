@@ -186,6 +186,19 @@ func baseEnv(extra ...string) []string {
 	return env
 }
 
+// initTestGitRepo marks dir as a Git working tree. The git_utils package only
+// needs .git/HEAD to recognize a repository, so tests do not invoke Git.
+func initTestGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // writeTestIdentity writes a temporary unencrypted Ed25519 OpenSSH key.
 func writeTestIdentity(t *testing.T) string {
 	t.Helper()
@@ -608,10 +621,11 @@ func TestE2EEncryptionKeyFileSources(t *testing.T) {
 
 	t.Run("config file", func(t *testing.T) {
 		dir := t.TempDir()
+		initTestGitRepo(t, dir)
 		key := writeTestIdentity(t)
 		db := filepath.Join(dir, "mgcl.db")
 		config := fmt.Sprintf("host: \"127.0.0.1:0\"\ndb: %q\nencryption_key_file: %q\n", db, key)
-		if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, ".mgcl.yaml"), []byte(config), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		run(t, dir, baseEnv(), "run", "--", "sh", "-c", "true")

@@ -12,6 +12,19 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// initTestGitRepo marks dir as a Git working tree. The git_utils package only
+// needs .git/HEAD to recognize a repository, so tests do not invoke Git.
+func initTestGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeTestIdentity(t *testing.T, passphrase []byte) string {
 	t.Helper()
 	_, private, err := ed25519.GenerateKey(rand.Reader)

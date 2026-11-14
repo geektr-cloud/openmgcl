@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/geektr-cloud/openmgcl/internal/sqlitebackup"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -17,15 +19,29 @@ import (
 type Store struct {
 	db       *sql.DB
 	identity *Identity
+	backup   *sqlitebackup.Manager
 
 	keyMu    sync.Mutex
 	keyCache map[string][]byte
+
+	writeMu      sync.RWMutex
+	writesClosed bool
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Open creates or opens the SQLite database at path, runs migrations, and
 // returns a ready-to-use Store. identity is mandatory: there is no plaintext
 // database mode.
 func Open(path string, identity *Identity) (*Store, error) {
+	return OpenWithBackup(path, identity, nil)
+}
+
+// OpenWithBackup is Open plus a reusable backup manager. The manager starts
+// after migrations and before the caller accepts traffic, so its initial
+// sqlite backup sees the complete schema.
+func OpenWithBackup(path string, identity *Identity, backup *sqlitebackup.Manager) (*Store, error) {
 	if identity == nil {
 		return nil, errors.New("encryption identity is required")
 	}
@@ -41,15 +57,85 @@ func Open(path string, identity *Identity) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{
+	store := &Store{
 		db:       db,
 		identity: identity,
+		backup:   backup,
 		keyCache: make(map[string][]byte),
-	}, nil
+	}
+	if backup != nil {
+		if err := backup.Start(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("start backup: %w", err)
+		}
+	}
+	return store, nil
 }
 
-// Close closes the underlying database connection.
-func (s *Store) Close() error { return s.db.Close() }
+// Close closes the underlying database connection. It first closes the write
+// gate and waits for in-flight writes, then runs the ordered backup shutdown
+// sequence: drain the sqlite worker, checkpoint and close the main database,
+// then copy path destinations.
+func (s *Store) Close() error {
+	s.StopWrites()
+	s.closeOnce.Do(func() {
+		if s.backup != nil {
+			s.closeErr = s.backup.Shutdown(s.db)
+			return
+		}
+		s.closeErr = s.db.Close()
+	})
+	return s.closeErr
+}
+
+// Abort closes the underlying database without running the backup shutdown
+// sequence. It is used when startup fails before traffic is accepted, so path
+// destinations keep their previous content. It also stops and waits for
+// in-flight writes.
+func (s *Store) Abort() error {
+	s.StopWrites()
+	s.closeOnce.Do(func() {
+		if s.backup != nil {
+			s.closeErr = s.backup.Abort(s.db)
+			return
+		}
+		s.closeErr = s.db.Close()
+	})
+	return s.closeErr
+}
+
+// StopWrites closes the write gate and waits until every in-flight write has
+// committed or rolled back. Later writes are rejected. It is idempotent.
+func (s *Store) StopWrites() {
+	s.writeMu.Lock()
+	s.writesClosed = true
+	s.writeMu.Unlock()
+}
+
+// beginWrite holds the write gate for the duration of one public write method,
+// including its commit and dirty mark. The returned release must be deferred.
+func (s *Store) beginWrite() (release func(), err error) {
+	s.writeMu.RLock()
+	if s.writesClosed {
+		s.writeMu.RUnlock()
+		return nil, errors.New("store is shutting down")
+	}
+	if s.backup != nil {
+		if err := s.backup.Err(); err != nil {
+			s.writeMu.RUnlock()
+			return nil, fmt.Errorf("backup unavailable: %w", err)
+		}
+	}
+	return s.writeMu.RUnlock, nil
+}
+
+// markDirty records a successful commit for the backup worker.
+func (s *Store) markDirty() error {
+	if s.backup == nil {
+		return nil
+	}
+	return s.backup.MarkDirty()
+}
 
 func migrate(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -103,6 +189,33 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_wrapped_lineage_keys_recipient
 			ON wrapped_lineage_keys(recipient_fingerprint)`,
+		`CREATE TABLE IF NOT EXISTS secrets (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS secret_deks (
+			secret_id TEXT PRIMARY KEY REFERENCES secrets(id) ON DELETE CASCADE,
+			dek_fingerprint TEXT NOT NULL UNIQUE,
+			recipient_fingerprint TEXT NOT NULL,
+			suite INTEGER NOT NULL,
+			ephemeral_public_key BLOB NOT NULL,
+			hkdf_salt BLOB NOT NULL,
+			nonce BLOB NOT NULL,
+			wrapped_dek BLOB NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS secret_kvs (
+			secret_id TEXT NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			suite INTEGER NOT NULL,
+			nonce BLOB NOT NULL,
+			ciphertext BLOB NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (secret_id, key)
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := tx.Exec(s); err != nil {
@@ -143,11 +256,17 @@ type Workspace struct {
 
 // CreateWorkspace inserts a new workspace. Returns the generated ID.
 func (s *Store) CreateWorkspace(org, name, tfVersion string) (*Workspace, error) {
+	release, err := s.beginWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	id := randomID("ws")
 	if tfVersion == "" {
 		tfVersion = "latest"
 	}
-	_, err := s.db.Exec(
+	_, err = s.db.Exec(
 		`INSERT INTO workspaces (id, organization, name, terraform_version) VALUES (?, ?, ?, ?)`,
 		id, org, name, tfVersion,
 	)
@@ -155,6 +274,9 @@ func (s *Store) CreateWorkspace(org, name, tfVersion string) (*Workspace, error)
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return nil, ErrConflict("workspace already exists")
 		}
+		return nil, err
+	}
+	if err := s.markDirty(); err != nil {
 		return nil, err
 	}
 	return s.GetWorkspaceByID(id)
@@ -252,6 +374,12 @@ func scanWorkspaceRows(rows *sql.Rows) (*Workspace, error) {
 
 // LockWorkspace acquires the workspace lock. Returns ErrConflict if already locked.
 func (s *Store) LockWorkspace(wsID, lockInfo string) error {
+	release, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -271,11 +399,20 @@ func (s *Store) LockWorkspace(wsID, lockInfo string) error {
 	if _, err := tx.Exec(`UPDATE workspaces SET locked = 1, lock_info = ? WHERE id = ?`, lockInfo, wsID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.markDirty()
 }
 
 // UnlockWorkspace releases the workspace lock. Returns ErrConflict if not locked.
 func (s *Store) UnlockWorkspace(wsID string) error {
+	release, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -295,7 +432,10 @@ func (s *Store) UnlockWorkspace(wsID string) error {
 	if _, err := tx.Exec(`UPDATE workspaces SET locked = 0, lock_info = NULL WHERE id = ?`, wsID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.markDirty()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -343,6 +483,12 @@ func (s *Store) GetMaxFinalizedSerial(wsID string) (int, error) {
 // The final bool parameter is retained for call-site compatibility. The
 // server does not trust force and it does not bypass any validation.
 func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string, state, jsonState, jsonStateOutputs []byte, _ bool) (*StateVersion, error) {
+	release, err := s.beginWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	if lineage == "" {
 		return nil, ErrUnprocessable("lineage is required")
 	}
@@ -454,6 +600,9 @@ func (s *Store) CreateStateVersion(wsID string, serial int, lineage, md5 string,
 		return nil, err
 	}
 	s.cacheKey(fingerprint, dek)
+	if err := s.markDirty(); err != nil {
+		return nil, err
+	}
 
 	// Return the row from this transaction rather than re-reading it: another
 	// concurrent same-serial retry may replace this pending row immediately
@@ -609,6 +758,12 @@ func (s *Store) UploadJSONState(id string, data []byte) error {
 }
 
 func (s *Store) uploadStateField(id, fieldName string, data []byte, finalize bool) error {
+	release, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -702,7 +857,7 @@ func (s *Store) uploadStateField(id, fieldName string, data []byte, finalize boo
 		return err
 	}
 	s.cacheKey(fingerprint, dek)
-	return nil
+	return s.markDirty()
 }
 
 func (s *Store) scanStateVersion(row *sql.Row) (*StateVersion, error) {

@@ -66,6 +66,18 @@ func TestDeriveServerURL(t *testing.T) {
 			explicitServer: "http://example.com//",
 			want:           "http://example.com",
 		},
+		{
+			name:         "ipv6 loopback",
+			host:         "[::1]:1217",
+			listenerAddr: "[::1]:1217",
+			want:         "http://[::1]:1217",
+		},
+		{
+			name:         "ipv6 zone escaped",
+			host:         "[fe80::1%eth0]:1217",
+			listenerAddr: "[fe80::1%eth0]:1217",
+			want:         "http://[fe80::1%25eth0]:1217",
+		},
 	}
 
 	for _, tt := range tests {

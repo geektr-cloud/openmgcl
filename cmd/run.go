@@ -15,40 +15,56 @@ import (
 	"strings"
 	"time"
 
+	"github.com/geektr-cloud/openmgcl/internal/sqlitebackup"
 	"github.com/geektr-cloud/openmgcl/internal/tacos"
+	"github.com/geektr-cloud/openmgcl/pkg/providerapi"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 const (
 	defaultHost             = "127.0.0.1:1217"
-	defaultDBPath           = "mgcl.db"
 	childGracePeriod        = 10 * time.Second
 	serverShutdownTimeout   = 10 * time.Second
 	serverReadHeaderTimeout = 10 * time.Second
 	serverIdleTimeout       = 2 * time.Minute
 )
 
-var runCmd = &cobra.Command{
-	Use:   "run [flags] [-- command [args...]]",
-	Short: "Start local MgCl server and optionally run a command",
-	Long: `Start a local HTTP server that serves /.well-known/terraform.json
+func newRunCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "run [flags] [-- command [args...]]",
+		Short: "Start local MgCl server and optionally run a command",
+		Long: `Start a local HTTP server that serves /.well-known/terraform.json
 and a TACOS state.v2 backend backed by SQLite.
 
 If a command is specified after --, it will be executed with TF_CLOUD_HOSTNAME
-and TF_CLI_CONFIG_FILE set up so OpenTofu can reach the local server. An existing
-TF_CLI_CONFIG_FILE is preserved and extended. The server will be shut down when
-the command exits. If no command is specified, the server runs until
-SIGINT/SIGTERM.
+and TF_CLI_CONFIG_FILE set up so OpenTofu can reach the local server, plus
+MGCL_PROVIDER_ENDPOINT and MGCL_PROVIDER_TOKEN for the ephemeral mgcl Secret
+provider. An existing TF_CLI_CONFIG_FILE is preserved and extended. The server
+will be shut down when the command exits. If no command is specified, the
+server runs until SIGINT/SIGTERM; a command-less run never issues a provider
+token.
+
+Listening on anything other than the literal host 127.0.0.1 publishes state
+and secrets. It requires a TTY confirmation or the exact flag
+--yes-i-know-it-will-publish-state-and-secrets.
+
+Configuration:
+  Inside a Git working tree, <git-root>/.mgcl.yaml supplies project config.
+  A database path is required: use --db, MGCL_DB, or db in .mgcl.yaml.
 
 Flags:
   -h, --host                  Listen address (default "127.0.0.1:1217")
   -s, --server                Base URL for Terraform (default derived from host)
-  -d, --db                    SQLite database path (default "mgcl.db")
+  -d, --db                    SQLite database path (required)
   -t, --token                 Bearer token for API auth (empty = no auth)
-      --encryption-key-file   SSH Ed25519 private key (default "~/.ssh/id_ed25519")`,
-	DisableFlagParsing: true,
-	RunE:               runRun,
+      --encryption-key-file   SSH Ed25519 private key (default "~/.ssh/id_ed25519")
+      --backup-to             Backup destination; repeatable (sqlite:<path> or path:<path>)
+      --yes-i-know-it-will-publish-state-and-secrets
+                              Skip the non-loopback confirmation prompt`,
+		DisableFlagParsing: true,
+		RunE:               runRun,
+	}
 }
 
 // deriveServerURL computes the server URL for discovery and upload/download links.
@@ -74,12 +90,24 @@ func deriveServerURL(host string, listenerAddr net.Addr, explicitServer string) 
 		h = "127.0.0.1"
 	}
 
-	// Handle IPv6
-	if strings.Contains(h, ":") {
-		h = "[" + h + "]"
-	}
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(h, port)}).String(), nil
+}
 
-	return fmt.Sprintf("http://%s:%s", h, port), nil
+// deriveProviderEndpoint builds the provider base URL from the actual listener,
+// never from --server. Wildcard listeners are normalized to 127.0.0.1 because
+// that is the address a local child can use.
+func deriveProviderEndpoint(listenerAddr net.Addr) (string, error) {
+	if listenerAddr == nil {
+		return "", errors.New("listener address is not available")
+	}
+	h, port, err := net.SplitHostPort(listenerAddr.String())
+	if err != nil {
+		return "", err
+	}
+	if h == "0.0.0.0" || h == "::" || h == "" {
+		h = "127.0.0.1"
+	}
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(h, port)}).String(), nil
 }
 
 // hostFromServerURL returns the host[:port] portion of serverURL, which is the
@@ -256,10 +284,12 @@ type runOptions struct {
 	dbPath            string
 	token             string
 	encryptionKeyFile string
+	backupTo          []string
 	command           []string
 	explicit          map[string]bool
 	showVersion       bool
 	showHelp          bool
+	yesPublish        bool
 }
 
 // parseRunArgs manually parses flags so -h can mean --host instead of help. It
@@ -269,8 +299,7 @@ type runOptions struct {
 func parseRunArgs(args []string) (*runOptions, error) {
 	opts := &runOptions{
 		host:     defaultHost,
-		dbPath:   defaultDBPath,
-		explicit: make(map[string]bool, 5),
+		explicit: make(map[string]bool, 6),
 	}
 
 	for i := 0; i < len(args); {
@@ -319,9 +348,20 @@ func parseRunArgs(args []string) (*runOptions, error) {
 			opts.encryptionKeyFile = value
 			opts.explicit["encryption_key_file"] = true
 			i = next
+		case "--backup-to":
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
+			}
+			opts.backupTo = append(opts.backupTo, value)
+			opts.explicit["backup_to"] = true
+			i = next
 		case "--version":
 			opts.showVersion = true
 			return opts, nil
+		case "--yes-i-know-it-will-publish-state-and-secrets":
+			opts.yesPublish = true
+			i++
 		case "--help":
 			opts.showHelp = true
 			return opts, nil
@@ -341,7 +381,11 @@ func nextFlagValue(args []string, i int, flag string) (string, int, error) {
 
 // applyConfig fills values that were not supplied on the command line. An
 // explicit flag always wins, even when it equals the default value or is empty.
-func (opts *runOptions) applyConfig(config *viper.Viper) {
+// Environment values take precedence over the project config file. The db value
+// is handled explicitly so its origin decides how a relative path is resolved:
+// flag/env stay relative to the process working directory, while a config-file
+// path is relative to the Git root.
+func (opts *runOptions) applyConfig(config *viper.Viper, projectRoot string) {
 	if !opts.explicit["host"] {
 		if value := config.GetString("host"); value != "" {
 			opts.host = value
@@ -353,8 +397,10 @@ func (opts *runOptions) applyConfig(config *viper.Viper) {
 		}
 	}
 	if !opts.explicit["db"] {
-		if value := config.GetString("db"); value != "" {
+		if value := os.Getenv("MGCL_DB"); value != "" {
 			opts.dbPath = value
+		} else if value := config.GetString("db"); value != "" {
+			opts.dbPath = resolveConfigDBPath(value, projectRoot)
 		}
 	}
 	if !opts.explicit["token"] {
@@ -367,6 +413,15 @@ func (opts *runOptions) applyConfig(config *viper.Viper) {
 			opts.encryptionKeyFile = value
 		}
 	}
+}
+
+// resolveConfigDBPath anchors a relative config-file database path at the Git
+// root. Absolute paths are returned unchanged.
+func resolveConfigDBPath(value, projectRoot string) string {
+	if filepath.IsAbs(value) || projectRoot == "" {
+		return value
+	}
+	return filepath.Join(projectRoot, value)
 }
 
 // exitCodeError carries a process exit code through Cobra without being printed
@@ -405,12 +460,14 @@ func childExitCode(err error) (int, error) {
 // runChildProcess starts child in its own process group and waits for it. On
 // SIGINT/SIGTERM the signal is forwarded to the whole group, a bounded grace
 // period is allowed, and the group is killed if it does not exit. A second
-// signal forces the group down immediately.
-func runChildProcess(child *exec.Cmd, sigCh <-chan os.Signal) (int, error) {
+// signal forces the group down immediately. A closed backupFatal channel means
+// the backup layer has failed fatally: the child group is terminated and
+// backupTriggered is true so the caller does not report a signal exit.
+func runChildProcess(child *exec.Cmd, sigCh <-chan os.Signal, backupFatal <-chan struct{}) (exitCode int, backupTriggered bool, err error) {
 	configureChildProcess(child)
 
 	if err := child.Start(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	// Hand the controlling terminal to the child's process group so interactive
 	// commands (tofu prompts, read, ...) can read stdin instead of receiving
@@ -431,14 +488,41 @@ func runChildProcess(child *exec.Cmd, sigCh <-chan os.Signal) (int, error) {
 		select {
 		case sig := <-sigCh:
 			fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
-			return signalExitCode(sig), nil
+			return signalExitCode(sig), false, nil
 		default:
 		}
-		return childExitCode(err)
+		code, err := childExitCode(err)
+		if err != nil {
+			return 0, false, err
+		}
+		// The child exited on its own; preserve its code even if a backup fatal
+		// arrived concurrently. The deferred backup shutdown still reports the
+		// backup failure and adjusts a successful child's exit code to 1.
+		return code, false, nil
 	case sig := <-sigCh:
 		fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
 		forwardSignal(child, sig)
-		return finishChildAfterSignal(child, waitCh, sigCh, sig), nil
+		return finishChildAfterSignal(child, waitCh, sigCh, sig), false, nil
+	case <-backupFatal:
+		// If the child already exited, let its own status win. Only terminate a
+		// still-running child and report the backup-triggered exit otherwise.
+		select {
+		case err := <-waitCh:
+			code, codeErr := childExitCode(err)
+			return code, false, codeErr
+		default:
+		}
+		killChildProcessGroup(child)
+		waitErr := <-waitCh
+		if waitErr == nil {
+			return 0, false, nil
+		}
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) && !processSignaled(exitErr.ProcessState) {
+			code, codeErr := childExitCode(waitErr)
+			return code, false, codeErr
+		}
+		return 0, true, nil
 	}
 }
 
@@ -485,27 +569,55 @@ func finishChildAfterSignal(child *exec.Cmd, waitCh <-chan error, sigCh <-chan o
 	}
 }
 
-func runRun(cmd *cobra.Command, args []string) error {
+func runRun(cmd *cobra.Command, args []string) (retErr error) {
 	opts, err := parseRunArgs(args)
 	if err != nil {
 		return err
 	}
 	if opts.showVersion {
-		fmt.Printf("mgcl %s\n", version)
+		fmt.Fprintf(cmd.OutOrStdout(), "mgcl %s\n", version)
 		return nil
 	}
 	if opts.showHelp {
-		fmt.Print(cmd.Long)
+		fmt.Fprint(cmd.OutOrStdout(), cmd.Long)
 		return nil
 	}
 
 	// Load config before touching the key, database, or listener so malformed
 	// config fails the command instead of silently running with defaults.
-	config, err := newConfig()
+	config, projectRoot, err := newConfig()
 	if err != nil {
 		return err
 	}
-	opts.applyConfig(config)
+	opts.applyConfig(config, projectRoot)
+
+	if opts.dbPath == "" {
+		return errors.New("database path is required: set --db, MGCL_DB, or db in .mgcl.yaml")
+	}
+
+	// Enforce the non-loopback exposure gate before any key, database,
+	// backup probe or listener work.
+	if err := checkPublishSafety(opts.host, opts.serverURL, opts.yesPublish, os.Stderr); err != nil {
+		return err
+	}
+
+	// Resolve and validate backup destinations before loading the key or
+	// opening the database. Path destinations are probed here as well.
+	backupSpecs, backupBase, err := opts.backupDestinations(config, projectRoot)
+	if err != nil {
+		return err
+	}
+	var backupManager *sqlitebackup.Manager
+	if len(backupSpecs) > 0 {
+		destinations, err := sqlitebackup.ParseDestinations(backupSpecs, backupBase)
+		if err != nil {
+			return fmt.Errorf("backup destination: %w", err)
+		}
+		backupManager, err = sqlitebackup.New(opts.dbPath, destinations)
+		if err != nil {
+			return fmt.Errorf("backup destination: %w", err)
+		}
+	}
 
 	if opts.encryptionKeyFile == "" {
 		home, err := os.UserHomeDir()
@@ -520,12 +632,35 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load encryption key: %w", err)
 	}
 
-	// Open the TACOS store
-	store, err := tacos.Open(opts.dbPath, identity)
+	// Open the TACOS store. With backups enabled this also performs the initial
+	// sqlite backup before any listener is created.
+	store, err := tacos.OpenWithBackup(opts.dbPath, identity, backupManager)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer store.Close()
+
+	var server *http.Server
+	sessionStarted := false
+	defer func() {
+		// Close the write gate first and wait for in-flight writes before HTTP
+		// shutdown and the backup drain. Store.Close repeats this idempotently.
+		store.StopWrites()
+		if server != nil {
+			shutdownServer(server)
+		}
+		var closeErr error
+		if sessionStarted {
+			closeErr = store.Close()
+		} else {
+			closeErr = store.Abort()
+		}
+		if closeErr != nil {
+			fmt.Fprintf(os.Stderr, "backup failed: %v\n", closeErr)
+			if retErr == nil {
+				retErr = &exitCodeError{code: 1}
+			}
+		}
+	}()
 
 	// Start HTTP server
 	listener, err := net.Listen("tcp", opts.host)
@@ -539,15 +674,26 @@ func runRun(cmd *cobra.Command, args []string) error {
 		listener.Close()
 		return fmt.Errorf("derive server URL: %w", err)
 	}
+	providerEndpoint, err := deriveProviderEndpoint(listener.Addr())
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("derive provider endpoint: %w", err)
+	}
 
-	handler := tacos.NewRouter(store, serverURL, opts.token)
-	server := &http.Server{
+	var providers *tacos.ProviderSessions
+	if len(opts.command) > 0 {
+		// Only a run with a child gets a provider session. A long-running
+		// server never issues or prints a token.
+		providers = tacos.NewProviderSessions()
+		defer providers.RevokeAll()
+	}
+
+	handler := tacos.NewRouter(store, serverURL, opts.token, providers)
+	server = &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}
-	// Every exit path shuts the server down before the deferred store.Close.
-	defer shutdownServer(server)
 
 	// Register signal handling before announcing readiness so a signal sent
 	// immediately after the listening line cannot bypass cleanup.
@@ -563,12 +709,30 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	// Server is ready since listener is already bound
 	fmt.Fprintf(os.Stderr, "MgCl server listening on %s\n", listener.Addr())
+	sessionStarted = true
+
+	var providerToken string
+	if providers != nil {
+		providerToken, err = providers.Issue()
+		if err != nil {
+			return fmt.Errorf("create provider session: %w", err)
+		}
+	}
+
+	var backupFatal <-chan struct{}
+	if backupManager != nil {
+		backupFatal = backupManager.Fatal()
+	}
 
 	if len(opts.command) == 0 {
-		// No command - wait for signal
-		sig := <-sigCh
-		fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
-		return &exitCodeError{code: signalExitCode(sig)}
+		// No command - wait for a signal or a fatal backup failure.
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "\nReceived %v, shutting down...\n", sig)
+			return &exitCodeError{code: signalExitCode(sig)}
+		case <-backupFatal:
+			return &exitCodeError{code: 1}
+		}
 	}
 
 	// Point OpenTofu at the local server. TF_CLOUD_HOSTNAME must be host[:port];
@@ -584,14 +748,25 @@ func runRun(cmd *cobra.Command, args []string) error {
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
-	child.Env = withEnv(dropEnv(os.Environ(), passphraseEnv),
+	child.Env = withEnv(dropEnv(os.Environ(), passphraseEnv, providerapi.EnvEndpoint, providerapi.EnvToken),
 		"TF_CLOUD_HOSTNAME="+hostname,
 		"TF_CLI_CONFIG_FILE="+cliConfigPath,
+		providerapi.EnvEndpoint+"="+providerEndpoint,
+		providerapi.EnvToken+"="+providerToken,
 	)
 
-	exitCode, err := runChildProcess(child, sigCh)
+	exitCode, backupTriggered, err := runChildProcess(child, sigCh, backupFatal)
+	// Revoke immediately when the child returns, before CLI-config cleanup and
+	// deferred server/backup shutdown can delay token invalidation. RevokeAll is
+	// idempotent; the defer remains as a fallback for early returns.
+	if providers != nil {
+		providers.RevokeAll()
+	}
 	if err != nil {
 		return err
+	}
+	if backupTriggered {
+		return &exitCodeError{code: 1}
 	}
 	if exitCode != 0 {
 		return &exitCodeError{code: exitCode}

@@ -46,7 +46,7 @@ _Avoid_: Project, State Family
 与一个 State Lineage 关联的数据密钥，用于保护该族 state version 的内容。同一 lineage 的历史及副本使用同一把密钥。
 
 **Recipient**:
-凭借对应 Ed25519 私钥解开 Lineage Key、从而获得该 lineage state 读写能力的主体。Recipient 不是 HTTP 用户或 Bearer token 身份。
+凭借对应 Ed25519 私钥解开 Lineage Key 或 Secret DEK 的主体，分别获得对应 lineage state 的读写能力或 Secret KV 的解密能力。Recipient 不是 HTTP 用户或 Bearer token 身份。
 
 **Key fingerprint**:
 Lineage Key 的标识，用于区分数据密钥及识别 state version 使用的密钥。
@@ -78,3 +78,27 @@ _Avoid_: overwrite, force unlock（后者是锁操作）
 
 **Lock**:
 workspace 级互斥锁，防止并发写 state；有 lock / unlock / force-unlock 三个操作。
+
+**Secret**:
+首次运行 OpenTofu 前需要准备的一组 bootstrap 凭据（例如 IAM access key、跨云凭据），以具名 KV 集合保存。它只覆盖 mgcl 接管的 bootstrap credentials，不接管 OpenTofu 创建的 state outputs。
+_Avoid_: state output, managed resource
+
+**KV**:
+Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。
+_Avoid_: secret version, key-value file
+
+**Secret DEK**:
+保护单个 Secret 全部 KV 的独立数据密钥。它与 State Lineage 的 Lineage Key 完全独立，绝不共用；首版每把 Secret DEK 只有一个 Recipient，且不轮换。
+_Avoid_: Lineage Key, state key
+
+**Provider session**:
+`mgcl run` 为每次子进程启动签发的短期、只读凭证，只能读取当前数据库里的 Secret，不能读写 TACOS state 或执行管理操作。它不同于用户 Bearer token 和 SSH passphrase。
+_Avoid_: MGCL_TOKEN, user token
+
+**Backup destination**:
+`mgcl run --backup-to` 或 `.mgcl.yaml` `backup_to` 的一个条目，格式 `<scheme>:<path>`。首版只允许两种语义固定的 scheme：`sqlite:<path>` 用 SQLite Online Backup API 在运行中覆盖最新副本；`path:<path>` 在写会话关闭并完成 WAL checkpoint 后用普通文件复制生成自包含副本，适用于不支持 SQLite 锁的挂载。两者都覆盖最新副本，不做版本轮换。
+_Avoid_: backup target, snapshot, dump
+
+**Write session**:
+打开 `mgcl.db` 并可能提交写入的进程生命周期，例如 `mgcl run` 服务和 `mgcl secret create/set/unset/delete`。每个写会话必须复用同一备份层；只读命令不是写会话。
+_Avoid_: backup job, sync process

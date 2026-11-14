@@ -100,3 +100,12 @@ func processExitCode(ps *os.ProcessState) int {
 	}
 	return code
 }
+
+// processSignaled reports whether the process was terminated by a signal.
+func processSignaled(ps *os.ProcessState) bool {
+	if ps == nil {
+		return false
+	}
+	status, ok := ps.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled()
+}

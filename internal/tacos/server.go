@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/geektr-cloud/openmgcl/pkg/providerapi"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
@@ -15,14 +16,24 @@ type Server struct {
 	store     *Store
 	serverURL string // base URL without trailing slash, e.g. "http://127.0.0.1:1217"
 	token     string // empty = no auth
+	providers *ProviderSessions
+
+	// afterProviderDecrypt is a deterministic test hook used to revoke a
+	// session between decryption and the final authorization check.
+	afterProviderDecrypt func()
 }
 
-// NewRouter returns the complete TACOS state.v2 HTTP handler.
-func NewRouter(store *Store, serverURL, token string) http.Handler {
+// NewRouter returns the complete TACOS state.v2 HTTP handler. An optional
+// provider session set enables the ephemeral Secret read API; without it that
+// endpoint always returns 401.
+func NewRouter(store *Store, serverURL, token string, providers ...*ProviderSessions) http.Handler {
 	s := &Server{
 		store:     store,
 		serverURL: strings.TrimRight(serverURL, "/"),
 		token:     token,
+	}
+	if len(providers) > 0 {
+		s.providers = providers[0]
 	}
 	return buildRouter(s)
 }
@@ -33,9 +44,16 @@ func buildRouter(s *Server) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RealIP)
 	r.Use(apiVersionMiddleware)
+	// Provider session tokens are never valid TACOS credentials, including on
+	// auth-exempt upload/download routes and unauthenticated discovery/ping.
+	r.Use(s.rejectProviderTokenMiddleware)
 
 	// Discovery document
 	r.Get("/.well-known/terraform.json", s.discoveryHandler)
+
+	// Provider Secret API. It is deliberately outside /api/v2 so provider
+	// tokens can never be confused with TACOS user tokens.
+	r.HandleFunc(providerapi.SecretsReadPath, s.secretsReadHandler)
 
 	// All API routes under /api/v2
 	r.Route("/api/v2", func(r chi.Router) {
@@ -88,17 +106,12 @@ func apiVersionMiddleware(next http.Handler) http.Handler {
 // bearerAuthMiddleware validates the Bearer token.
 func (s *Server) bearerAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
-			writeError(w, http.StatusUnauthorized, "Unauthorized", "missing Authorization header")
+		token, ok := bearerToken(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "Unauthorized", "missing or invalid Authorization header")
 			return
 		}
-		parts := strings.SplitN(auth, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			writeError(w, http.StatusUnauthorized, "Unauthorized", "invalid Authorization format")
-			return
-		}
-		if parts[1] != s.token {
+		if token != s.token {
 			writeError(w, http.StatusUnauthorized, "Unauthorized", "invalid token")
 			return
 		}

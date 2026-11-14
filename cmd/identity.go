@@ -12,6 +12,13 @@ import (
 const passphraseEnv = "MGCL_ENCRYPTION_KEY_PASSPHRASE"
 
 func loadEncryptionIdentity(path string) (*tacos.Identity, error) {
+	return loadEncryptionIdentityTTY(path, true)
+}
+
+// loadEncryptionIdentityTTY loads the key without changing the passphrase
+// rules. allowTTY=false is used by commands whose stdin is already consumed as
+// data (for example secret set --stdin), so they never prompt on that stream.
+func loadEncryptionIdentityTTY(path string, allowTTY bool) (*tacos.Identity, error) {
 	identity, err := tacos.LoadIdentity(path, nil)
 	if err == nil {
 		return identity, nil
@@ -25,7 +32,10 @@ func loadEncryptionIdentity(path string) (*tacos.Identity, error) {
 		defer clearPassphrase(value)
 		return tacos.LoadIdentity(path, value)
 	}
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
+	if !allowTTY {
+		return nil, fmt.Errorf("encryption key requires a passphrase; set %s when using --stdin or non-interactive stdin", passphraseEnv)
+	}
+	if !stdinIsTerminal() {
 		return nil, errors.New("encryption key requires a passphrase, but stdin is not a terminal")
 	}
 

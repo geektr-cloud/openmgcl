@@ -80,7 +80,16 @@ func newWrappedLineageKeyWithRand(identity *Identity, lineage string, random io.
 	fingerprint := lineageKeyFingerprint(dek)
 	fingerprintText := fingerprintString(fingerprint[:])
 
-	ephemeral, err := ecdh.X25519().GenerateKey(random)
+	// Read the ephemeral scalar directly instead of using GenerateKey: newer Go
+	// versions ignore the supplied reader unless GODEBUG=cryptocustomrand=1,
+	// which makes deterministic wrapping tests (and the golden vector) unstable.
+	// NewPrivateKey performs the same X25519 clamping as GenerateKey.
+	ephemeralScalar := make([]byte, 32)
+	if _, err := io.ReadFull(random, ephemeralScalar); err != nil {
+		return nil, nil, fmt.Errorf("generate wrapping key: %w", err)
+	}
+	defer clearBytes(ephemeralScalar)
+	ephemeral, err := ecdh.X25519().NewPrivateKey(ephemeralScalar)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate wrapping key: %w", err)
 	}

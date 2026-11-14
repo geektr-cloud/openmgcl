@@ -44,3 +44,5 @@ func processExitCode(ps *os.ProcessState) int {
 	}
 	return code
 }
+
+func processSignaled(ps *os.ProcessState) bool { return false }

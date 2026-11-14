@@ -1,6 +1,6 @@
 # OpenMgCl (mgcl)
 
-OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状态后端：启动一个 HTTP 服务，把 workspace 和 state 存进本地 SQLite，让 `tofu` 的 `cloud` block 或 `remote` backend 把 state 保存在本机。
+OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状态后端和 bootstrap Secret 提供者：启动一个 HTTP 服务，把 workspace、state 和 bootstrap 凭据存进本地 SQLite，让 `tofu` 的 `cloud` block 或 `remote` backend 把 state 保存在本机，并让 ephemeral provider 在 plan/apply 时读取凭据。
 
 名字来自 MgCl₂（氯化镁）——豆腐点卤的凝固剂，呼应"给 OpenTofu 提供后端、让 tofu 成形"的定位。
 
@@ -8,23 +8,29 @@ OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状�
 
 ## 状态
 
-已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。state、JSON state 和 outputs 在 SQLite 中强制加密；e2e 覆盖 remote backend、cloud block、lock 冲突、`mgcl run --` 和错误私钥被拒绝。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
+已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。state、JSON state 和 outputs 在 SQLite 中强制加密；bootstrap Secret 也保存在同一个加密数据库中，并通过 `mgcl run --` 签发的短期只读 provider session 提供给独立的 ephemeral provider。e2e 覆盖 remote backend、cloud block、lock 冲突、`mgcl run --`、错误私钥被拒绝和 provider token 生命周期。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
 
 目标场景是从零启动整套基础设施时的本地手动、交互式 OpenTofu 使用，不以 CI 或无人值守运行为目标。
 
 ## 安装
 
-需要 Go 1.25+：
+需要 Go 1.27.4+：
 
 ```bash
 go build -o mgcl .
 ```
 
-或从 GitHub Releases 下载 `mgcl-linux-amd64` / `mgcl-linux-arm64`。
+或：
+
+```bash
+go install github.com/geektr-cloud/openmgcl/cmd/mgcl@<version>
+```
+
+`cmd/mgcl` 与仓库根入口共用同一套退出码处理；安装出的命令名是 `mgcl`。也可以从 GitHub Releases 下载 `mgcl-linux-amd64` / `mgcl-linux-arm64`。
 
 ## 加密私钥
 
-mgcl 强制加密 state，没有明文模式。默认读取 `~/.ssh/id_ed25519`；不存在、权限允许其他用户访问或不是 Ed25519 OpenSSH 私钥时会拒绝启动。
+mgcl 强制加密 state 和 Secret，没有明文模式。默认读取 `~/.ssh/id_ed25519`；不存在、权限允许其他用户访问或不是 Ed25519 OpenSSH 私钥时会拒绝启动。
 
 ```bash
 ls -l ~/.ssh/id_ed25519
@@ -33,14 +39,62 @@ ls -l ~/.ssh/id_ed25519
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
 
 # 或显式指定另一把私钥：
-mgcl run --encryption-key-file ~/.ssh/mgcl_ed25519 -- ...
+mgcl run --db ./mgcl.db --encryption-key-file ~/.ssh/mgcl_ed25519 -- ...
 ```
 
 私钥受 passphrase 保护时，优先使用 `MGCL_ENCRYPTION_KEY_PASSPHRASE`；未设置时会从 TTY 无回显提示。
 
-> **私钥丢失后，对应的 state 无法恢复。** `mgcl.db` 和私钥要一起备份。加密只保护静态数据库文件，mgcl 运行时会解密 state；它不保护已泄露的数据库副本、正在运行的进程、现有免认证下载端点，也不防能改写数据库的主动攻击者替换密钥元数据。
+> **私钥丢失后，对应的 state 和 Secret 都无法恢复。** `mgcl.db` 和私钥要一起备份。加密只保护静态数据库文件，mgcl 运行时会解密 state 和 Secret；它不保护已泄露的数据库副本、正在运行的进程、现有免认证下载端点，也不防能改写数据库的主动攻击者替换密钥元数据。
 
 实现边界见 [docs/state-encryption.md](docs/state-encryption.md)，决策见 [ADR-0004](docs/adr/0004-encrypt-state-by-lineage.md)。
+
+## Bootstrap Secret
+
+OpenTofu 第一次 apply 之前需要的凭据（例如 IAM access key）可以存进同一个 `mgcl.db`。Secret 是具名 KV 集合；每个 Secret 有独立的 32-byte DEK，DEK 再由当前 SSH Ed25519 Recipient 包裹。KV value 用 AES-256-GCM 单独加密，SQLite 里只有密文和明文元数据。
+
+```bash
+# 先创建空 Secret
+mgcl secret create bootstrap --db ./mgcl.db
+
+# 敏感值优先从 stdin 或 TTY 无回显输入，避免进入 shell history / argv
+printf '%s' "$AWS_ACCESS_KEY_ID" | \
+  mgcl secret set bootstrap/access_key_id --stdin --db ./mgcl.db
+
+mgcl secret set bootstrap/secret_access_key --db ./mgcl.db
+# 没有位置 value 且 stdin 是 TTY 时，会从 TTY 无回显读取一次
+
+mgcl secret list --db ./mgcl.db
+mgcl secret show bootstrap --db ./mgcl.db -o json
+mgcl secret get bootstrap/access_key_id --db ./mgcl.db
+mgcl secret unset bootstrap/secret_access_key --db ./mgcl.db
+mgcl secret delete bootstrap --yes --db ./mgcl.db
+```
+
+约束：
+
+- Secret 名和 KV key 都匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，引用为 `<secret-name>/<key>`；
+- value 必须是 UTF-8，单值最多 64 KiB，每个 Secret 最多 64 个 KV、合计最多 256 KiB；
+- 只保留最新值，没有历史版本；`set` 覆盖，`unset`/`delete` 不做安全擦除；
+- `list`、`show` 只读明文元数据，不加载私钥，也不会创建缺失的数据库；
+- `create` 可以在缺失路径初始化数据库；`set`、`get`、`unset`、`delete` 不隐式建库；
+- `list`、`show`、`get` 用 `mode=ro` 读取现有数据库，不使用 `immutable=1`。WAL 数据库缺少 `-shm` 时，SQLite 可能需要在数据库目录创建它，因此目录可能需要可写；这样才能读到尚未 checkpoint 的数据；
+- `create`、`set`、`unset`、`delete` 是 write session，复用 `--backup-to` / `backup_to` 备份层；`list`、`show`、`get` 不触发备份；
+- 私钥丢失后对应 Secret 也无法恢复。`mgcl.db` 与私钥必须一起备份。
+
+`get` 把原始 UTF-8 字节写到 stdout，不追加换行；诊断和成功提示写 stderr。任何错误、日志或提示都不会打印 value、DEK、wrapped key、nonce 或 provider token。
+
+完整语义见 [docs/secret-management.md](docs/secret-management.md)。
+
+## 非 loopback 安全门
+
+默认监听 `127.0.0.1` 不需要确认。合并后的 listen host 或显式 `--server` 只要不是字面值 `127.0.0.1`（`localhost`、`::1`、`0.0.0.0`、`127.0.0.2`、LAN IP、主机名等都算），`mgcl run` 会在加载私钥、打开数据库和监听前要求确认：
+
+- stdin 是 TTY 时显示警告并只接受 `y` / `yes`；
+- 非 TTY 时必须精确传入 `--yes-i-know-it-will-publish-state-and-secrets`；
+- 这个 flag 不能来自环境变量或 `.mgcl.yaml`；
+- 确认后服务会暴露到非 loopback。provider endpoint 是 HTTP；TACOS `--server` 可能是 HTTP 或 HTTPS，是否加密取决于你的配置。
+
+该门禁只放宽网络暴露面，不关闭 provider token 认证。
 
 ## 快速开始
 
@@ -116,33 +170,114 @@ tofu apply -auto-approve -input=false
 
 `remote` backend 则把 `hostname = "127.0.0.1:1217"` 写进 `backend "remote"` 块。
 
+### Provider（独立仓）
+
+ephemeral provider 已在独立仓库 `github.com/geektr-cloud/terraform-provider-mgcl` 实现。`mgcl run -- <command>` 只在该子进程环境里注入：
+
+```text
+MGCL_PROVIDER_ENDPOINT=http://127.0.0.1:<实际端口>
+MGCL_PROVIDER_TOKEN=<一次性随机 token>
+```
+
+常驻 `mgcl run`（没有子进程）不签发、不打印 token。token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。它只能调用 `POST /api/mgcl/v1/secrets:read`，不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 Secret API。endpoint 从实际 listener 推导，不使用 `--server`。
+
+provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后用 `dev_overrides`：
+
+```hcl
+# dev.tfrc
+provider_installation {
+  dev_overrides {
+    "geektr-cloud/mgcl" = "/path/to/terraform-provider-mgcl/bin"
+  }
+  direct {}
+}
+```
+
+```bash
+export TF_CLI_CONFIG_FILE=/path/to/dev.tfrc
+mgcl run --db ./mgcl.db -- tofu plan
+```
+
+HCL 示例：
+
+```hcl
+terraform {
+  required_providers {
+    mgcl = { source = "geektr-cloud/mgcl" }
+  }
+}
+
+provider "mgcl" {}
+
+ephemeral "mgcl_secret" "bootstrap" {
+  name = "bootstrap"
+}
+
+provider "aws" {
+  region     = "us-east-1"
+  access_key = ephemeral.mgcl_secret.bootstrap.values["access_key_id"]
+  secret_key = ephemeral.mgcl_secret.bootstrap.values["secret_access_key"]
+}
+```
+
+`pkg/providerapi` 是 stdlib-only 客户端合同，供 provider 仓库导入。首版没有 provider function、普通 data source、cloud workspace variables 或 HTTP 管理 API；`tofu init` 的无缝安装要等 Registry 发布。
+
 ## 配置
 
 | flag | 默认值 | 说明 |
 |---|---|---|
 | `--host`, `-h` | `127.0.0.1:1217` | 监听地址；`127.0.0.1:0` 自动选端口 |
 | `--server`, `-s` | 从 `--host` 推导 | 对外 base URL，用于 discovery 和上传/下载链接 |
-| `--db`, `-d` | `mgcl.db` | SQLite 路径；WAL 模式，会生成 `-wal` / `-shm` |
+| `--db`, `-d` | 无（必填） | SQLite 路径；WAL 模式，会生成 `-wal` / `-shm` |
 | `--token`, `-t` | 空 | Bearer token；为空表示不认证 |
 | `--encryption-key-file` | `~/.ssh/id_ed25519` | 强制加密使用的 Ed25519 OpenSSH 私钥 |
+| `--backup-to` | 无 | 备份目标；可重复，`sqlite:<path>` 或 `path:<path>`；出现时整体替换 YAML `backup_to`；`mgcl run` 和 `mgcl secret` 写命令使用 |
 
-也可以使用 `config.yaml`（搜索 `./config.yaml` 和 `/etc/mgcl/config.yaml`）：
+在 Git 工作树内运行时，mgcl 从当前目录定位最近的 Git 根目录（支持 worktree 和 submodule），读取 `<git-root>/.mgcl.yaml`。在子目录运行也会读取根目录的配置。非 Git 目录不读取任何 `.mgcl.yaml`，也不会回退到当前目录。
 
 ```yaml
+# <git-root>/.mgcl.yaml
 host: "127.0.0.1:1217"
 server: "http://127.0.0.1:1217"
-db: "./mgcl.db"
+db: "mgcl.db"
 token: "dev-token"
 encryption_key_file: "/home/you/.ssh/id_ed25519"
+backup_to:
+  - "sqlite:/srv/mgcl-backup/mgcl.db"
+  - "path:/mnt/no-locks/backup/mgcl.db"
 ```
 
-或环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`、`MGCL_ENCRYPTION_KEY_FILE`。`MGCL_ENCRYPTION_KEY_PASSPHRASE` 只从环境或 TTY 读取，不能写进配置。
+`db` 来自 `.mgcl.yaml` 时，相对路径按 Git 根目录解析；来自 `--db` 或 `MGCL_DB` 时，相对路径按进程当前工作目录解析。绝对路径保持不变。`.mgcl.yaml` 可能包含 token，默认应加入 `.gitignore`。
 
-配置优先级：显式 flag（包括空串或显式设为默认值）> `MGCL_*` 环境变量 > `./config.yaml` > `/etc/mgcl/config.yaml` > 内置默认值。
+也可以使用环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`、`MGCL_ENCRYPTION_KEY_FILE`。`MGCL_ENCRYPTION_KEY_PASSPHRASE` 只从环境或 TTY 读取，不能写进配置。
+
+配置优先级：显式 flag（包括显式空串）> `MGCL_*` 环境变量 > `<git-root>/.mgcl.yaml` > 内置默认值。`db` 没有内置默认值：最终 db 为空时，mgcl 会在加载私钥、打开数据库和监听端口之前报错退出。即使 `--db` 或 `MGCL_DB` 已提供，Git 内仍会读取 `.mgcl.yaml` 以获取其他配置；配置损坏或不可读会直接失败。
+
+### 数据库备份
+
+`--backup-to` 可重复，用于在 `mgcl run` 或 `mgcl secret create/set/unset/delete` 期间把同一个 `mgcl.db` 覆盖复制到显式配置的位置。YAML 使用 `backup_to` 字符串数组；只要出现 `--backup-to`，整份列表就替换 YAML，不做合并。不读取 `MGCL_BACKUP_TO`。`--backup-to` 的相对路径按当前工作目录解析，YAML 的相对路径按 Git 根目录解析。`mgcl secret list/show/get` 不触发备份。
+
+```bash
+mgcl run --db ./mgcl.db \
+  --backup-to sqlite:./backup/mgcl.db \
+  --backup-to path:/mnt/no-locks/backup/mgcl.db \
+  -- tofu apply -auto-approve
+```
+
+两种 scheme 不能互换：
+
+- `sqlite:<path>`：启动时先做一次完整的 SQLite Online Backup，之后每次成功写提交都会唤醒唯一后台 worker 合并同步；干净关停前会 drain 最后一轮。目标要求文件系统支持 SQLite 锁。
+- `path:<path>`：启动时只在目标同目录做 0600 可写探测；运行中不复制。停止写、drain、checkpoint 并关闭主库后，才把自包含的主文件复制到同目录临时文件并 rename 覆盖。目标不依赖 `-wal`/`-shm`/`-journal`，适合不支持 SQLite 锁的挂载。
+
+备份失败 fail-closed：启动校验、探测或初始备份失败不会启动服务；运行中 sqlite 同步失败会停止接受新写并终止子进程；关停时在子进程退出或信号处理完成后，先关闭写 gate、等待在途写完成，再 drain/checkpoint/copy，path 复制失败同样令命令失败。子进程自己的非零退出码会保留；子进程成功但备份失败时退出 1；备份主动终止 run 时不会伪装成 `128+signal`。已经提交的源事务不会回滚。
+
+对于 `mgcl secret`：Secret 写命令遇到非法备份配置会在加载私钥或打开数据库前失败；只读的 `list/show/get` 不 probe、不创建备份目标；Secret 写命令的备份失败一律非零退出，且不打印成功提示。
+
+备份内容沿用数据库现有加密格式，仍需和私钥一起保存。完整语义、校验规则与退出码见 [docs/database-backup.md](docs/database-backup.md)，决策见 [ADR-0007](docs/adr/0007-sqlite-backup-destinations.md)。
 
 ## 已实现的 API
 
-TACOS `state.v2` 子集：
+TACOS `state.v2` 子集与 provider Secret API：
 
 - `GET /.well-known/terraform.json`
 - `GET /api/v2/ping`
@@ -156,8 +291,9 @@ TACOS `state.v2` 子集：
 - `PUT /api/v2/state-versions/{id}/state-upload`（免认证）
 - `PUT /api/v2/state-versions/{id}/json-state-upload`（免认证）
 - `GET /api/v2/state-versions/{id}/download`（免认证）
+- `POST /api/mgcl/v1/secrets:read`（provider session token；`Cache-Control: no-store`）
 
-`--token` 非空时，除 discovery、ping 和 foreign upload/download 外的 API 都需要 `Authorization: Bearer <token>`。
+`--token` 非空时，除 discovery、ping 和 foreign upload/download 外的 TACOS API 都需要 `Authorization: Bearer <token>`。provider session token 只接受于 `secrets:read`，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 `secrets:read`。没有活跃 provider session 时该端点一律 401。
 
 ## 限制
 
@@ -175,6 +311,10 @@ TACOS `state.v2` 子集：
 - 上传 raw state / JSON state 上限约 100MiB；含 base64 inline state 的 create 请求留有 base64 余量；workspace 和 lock 请求上限 1MiB；超限返回 413。
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
+- 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。
+- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 token。token 是短期只读凭证，不是 TACOS 用户 token，也不能管理 Secret。
+- Secret 写入与 `mgcl run` 共用同一个 `mgcl.db` 和备份层；同一数据库不应同时运行多个写会话。备份不含明文 value，恢复仍只依赖 `mgcl.db` 和私钥。
+- 非 loopback provider endpoint 或 serverURL 需要显式确认。provider endpoint 是 HTTP；`--server` 的加密取决于其 scheme。
 - 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。
 - 不支持旧明文数据库迁移。遇到既有明文 state 会明确报错，不会静默返回明文。
 
@@ -185,6 +325,7 @@ go test ./...        # tofu 不在 PATH 时自动跳过 e2e
 go test -short ./... # 显式跳过 e2e
 go vet ./...
 go build -o mgcl .
+go build -o mgcl ./cmd/mgcl
 ```
 
 CI 会安装最新 OpenTofu 并跑完整 e2e；release 门禁同样会跑。

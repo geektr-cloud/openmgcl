@@ -46,10 +46,10 @@ OpenMgCl 用于从零启动整套基础设施，目标场景是本地手动、�
 |---|---|
 | flag | `mgcl run --encryption-key-file <path>` |
 | 环境变量 | `MGCL_ENCRYPTION_KEY_FILE` |
-| `config.yaml` | `encryption_key_file: <path>` |
+| `<git-root>/.mgcl.yaml` | `encryption_key_file: <path>` |
 | 默认值 | `~/.ssh/id_ed25519` |
 
-优先级沿用现有规则：显式 flag > 环境变量/config > 默认路径。不要增加 `--encryption` 或任何 plaintext opt-out。
+优先级沿用现有规则：显式 flag > 环境变量 > `<git-root>/.mgcl.yaml` > 默认路径。配置只在 Git 工作树内读取；非 Git 目录不读取配置文件。不要增加 `--encryption` 或任何 plaintext opt-out。
 
 要求：
 
@@ -202,7 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_wrapped_lineage_keys_recipient
 - 12-byte random nonce；
 - v1 canonical AAD。
 
-使用标准库 `crypto/ecdh`、`crypto/hkdf`、`crypto/aes`、`crypto/cipher`、`crypto/rand`。Go 1.25 的 `hkdf.Key` 可一次完成 Extract+Expand。
+使用标准库 `crypto/ecdh`、`crypto/hkdf`、`crypto/aes`、`crypto/cipher`、`crypto/rand`。`hkdf.Key` 可一次完成 Extract+Expand。
 
 ### 6.1 Canonical byte encoding
 
@@ -408,7 +408,7 @@ Store 返回给现有 handler 的 `StateVersion` 仍是明文表示；数据库 
 - `golang.org/x/term`（TTY 无回显输入）；
 - `filippo.io/edwards25519`（公钥转换与一致性校验）。
 
-HKDF、ECDH、AES-GCM 使用 Go 1.25 标准库，不再添加第三套 crypto 实现。
+HKDF、ECDH、AES-GCM 使用 Go 标准库，不再添加第三套 crypto 实现。
 
 ## 11. 必须完成的测试
 

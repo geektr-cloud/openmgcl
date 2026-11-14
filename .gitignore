@@ -1,4 +1,5 @@
 mgcl
 mgcl.db*
+.mgcl.yaml
 dist/
 .codegraph/

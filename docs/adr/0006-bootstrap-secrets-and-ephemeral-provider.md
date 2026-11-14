@@ -1,0 +1,11 @@
+# Bootstrap secrets 由独立 ephemeral provider 提供
+
+mgcl 只接管首次运行 OpenTofu 前必须准备的 bootstrap credentials（IAM access key、跨云凭据等），不自动导入或接管 OpenTofu 创建的 state outputs。Secret 是 KV 集合；同一个 Secret 共用一把独立 Secret DEK，KV 分别加密，但绝不复用 State Lineage 的 Lineage Key。凭据与 state 复用同一 `mgcl.db`、同一 SSH Recipient/identity，使用独立 secrets 表、独立 envelope 标签/AAD 和密钥元数据；只保留最新 KV，不做历史版本、多 Recipient 或 DEK rotation。备份 `mgcl.db` 与私钥即可恢复；私钥丢失不可恢复。
+
+唯一主接口是 OpenTofu >=1.11 的 ephemeral resource，首版只支持 `mgcl run -- <command>` 的子进程；常驻 `mgcl run` 不签发 token，也不增加获取常驻 token 的能力。`mgcl run` 为每次启动的子进程生成密码学随机、短期、只读 provider session token，通过 `MGCL_PROVIDER_ENDPOINT` 和 `MGCL_PROVIDER_TOKEN` 注入；provider session 注入的只有 endpoint 与 token，Secret value 不进入环境，而由 provider 通过 API/RPC 读取后留在 tofu/provider 内存。token 只能读取当前 db 的 Secret，不能读写 TACOS state，也不能执行管理操作；它与用户 `MGCL_TOKEN`、SSH passphrase 不复用。provider 位于独立仓库 `github.com/geektr-cloud/terraform-provider-mgcl`，本仓不内嵌 provider，也不采用 monorepo 或本地 registry 模拟；本仓未来提供 stdlib-only 的 `pkg/providerapi` 供其导入。开发期用 `go install` 生成 provider 二进制，`dev_overrides` 快速验证，filesystem mirror 覆盖需要 `tofu init` 的路径；正式无缝 `tofu init` 等 GitHub Release 与 OpenTofu Registry 发布后再提供。
+
+非 loopback 监听默认需要二次确认。`mgcl run` 同时检查有效 listen host 和有效 serverURL；只有两者 host 都是字面 `127.0.0.1` 才免确认，`localhost`、`::1`、`0.0.0.0` 等都要在加载私钥/DB 和监听前确认。TTY 提示会公开 state 与 secrets，非 TTY 必须显式使用 `--yes-i-know-it-will-publish-state-and-secrets`。`--server` 只是 TACOS 对外 URL，不用于 provider endpoint；Secret API 仍要求有效 provider token，安全门放宽的是网络暴露面、token 和 HTTP 明文流量风险，不是认证。这是允许用户承担风险的逃生门，最终不采用“secret API 永远只限 loopback”的方案。
+
+未采用把云凭据作为环境变量注入（会进入进程树、日志和子进程环境；短期 provider token 的 endpoint/token env 注入不在此列，它不承载云凭据）、provider function（返回值不能标 sensitive/ephemeral，可能落入 plan/state）、cloud workspace variables（本地 plan/apply 不读取）、普通 data source（值会进入 state）、复用 Lineage Key（把 bootstrap 凭据绑到 state lineage 生命周期，扩大影响面）、独立 `secrets.db`（破坏“db + 私钥”单份备份恢复）、内嵌 provider/monorepo/本地 registry 模拟（耦合发布与安装），以及自动导入 state outputs（超出 bootstrap 边界且与既有 state 加密重复）。
+
+后果：首版没有 CI/无人值守、多 Recipient、撤销、DEK rotation、secret 历史、安全擦除，也不发布 provider 到 Registry；endpoint/token 会继承给子进程树，不构成同用户进程隔离。完整契约见 [secret-management.md](../secret-management.md)。

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -240,10 +241,11 @@ func TestCLIBadConfigFailsBeforeStartup(t *testing.T) {
 
 	bin := buildMgcl(t)
 	dir := t.TempDir()
+	initTestGitRepo(t, dir)
 	dbPath := filepath.Join(dir, "mgcl.db")
 	keyPath := writeTestIdentity(t)
 
-	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("host: [unterminated\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".mgcl.yaml"), []byte("host: [unterminated\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -263,6 +265,147 @@ func TestCLIBadConfigFailsBeforeStartup(t *testing.T) {
 	}
 	if !strings.Contains(out, "read config") {
 		t.Fatalf("expected config read error, got:\n%s", out)
+	}
+}
+
+func TestCLIMissingDBFailsBeforeStartup(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	missingKey := filepath.Join(dir, "missing-key")
+
+	code, out := runMgclSync(t, bin, dir, baseEnv(),
+		"run", "--host", "127.0.0.1:0", "--encryption-key-file", missingKey,
+		"--", "sh", "-c", "true")
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out)
+	}
+	if !strings.Contains(out, "database path is required") {
+		t.Fatalf("expected missing database error, got:\n%s", out)
+	}
+	if strings.Contains(out, "MgCl server listening on") {
+		t.Fatalf("server started without a database path:\n%s", out)
+	}
+}
+
+func TestCLIExplicitEmptyDBDoesNotFallBackToEnvironment(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	keyPath := writeTestIdentity(t)
+	envDB := filepath.Join(dir, "env.db")
+
+	code, out := runMgclSync(t, bin, dir, baseEnv("MGCL_DB="+envDB),
+		"run", "--host", "127.0.0.1:0", "--db", "", "--encryption-key-file", keyPath,
+		"--", "sh", "-c", "true")
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1\n%s", code, out)
+	}
+	if !strings.Contains(out, "database path is required") {
+		t.Fatalf("expected missing database error, got:\n%s", out)
+	}
+	if _, err := os.Stat(envDB); !os.IsNotExist(err) {
+		t.Fatalf("environment database was used despite explicit empty --db: %v", err)
+	}
+}
+
+func TestCLIConfigDBRelativeToGitRootFromSubdirectory(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	root := t.TempDir()
+	initTestGitRepo(t, root)
+	subdir := filepath.Join(root, "nested", "workdir")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := writeTestIdentity(t)
+	config := fmt.Sprintf("host: \"127.0.0.1:0\"\ndb: project.db\nencryption_key_file: %q\n", keyPath)
+	if err := os.WriteFile(filepath.Join(root, ".mgcl.yaml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := runMgclSync(t, bin, subdir, baseEnv(),
+		"run", "--", "sh", "-c", "true")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "project.db")); err != nil {
+		t.Fatalf("database was not created relative to Git root: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(subdir, "project.db")); !os.IsNotExist(err) {
+		t.Fatalf("database was created relative to the working directory: %v", err)
+	}
+}
+
+func TestCLINonGitUsesFlagDBWithoutReadingMgclYAML(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	keyPath := writeTestIdentity(t)
+	dbPath := filepath.Join(dir, "flag.db")
+	if err := os.WriteFile(filepath.Join(dir, ".mgcl.yaml"), []byte("host: [unterminated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := runMgclSync(t, bin, dir, baseEnv(),
+		"run", "--host", "127.0.0.1:0", "--db", dbPath,
+		"--encryption-key-file", keyPath, "--", "sh", "-c", "true")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database was not created: %v", err)
+	}
+}
+
+func TestCLINonGitUsesEnvDBRelativeToCwd(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	keyPath := writeTestIdentity(t)
+	if err := os.WriteFile(filepath.Join(dir, ".mgcl.yaml"), []byte("host: [unterminated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := runMgclSync(t, bin, dir, baseEnv("MGCL_DB=env.db"),
+		"run", "--host", "127.0.0.1:0", "--encryption-key-file", keyPath,
+		"--", "sh", "-c", "true")
+
+	dbPath := filepath.Join(dir, "env.db")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0\n%s", code, out)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database was not created relative to cwd: %v", err)
+	}
+}
+
+func TestCLIHelpAndVersionDoNotRequireDB(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+
+	for _, args := range [][]string{
+		{"run", "--help"},
+		{"run", "--version"},
+	} {
+		code, out := runMgclSync(t, bin, dir, baseEnv(), args...)
+		if code != 0 {
+			t.Fatalf("%v exit code = %d, want 0\n%s", args, code, out)
+		}
+		if strings.Contains(out, "Error:") {
+			t.Fatalf("%v failed without a database:\n%s", args, out)
+		}
 	}
 }
 

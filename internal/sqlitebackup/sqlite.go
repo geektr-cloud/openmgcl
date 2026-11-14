@@ -70,8 +70,9 @@ func nonEmptyFile(path string) bool {
 }
 
 // precreateSQLiteTarget reserves a new target with mode 0600 before the
-// Online Backup API opens it. Without this, a failure between creation and the
-// final chmod can leave a 0644 file. Existing targets are left untouched.
+// Online Backup API opens it. Without this, a newly created file would inherit
+// the process umask (often 0644) and stay too permissive. Existing targets are
+// left untouched, including their permissions.
 func precreateSQLiteTarget(path string) error {
 	if _, err := os.Lstat(path); err == nil {
 		return nil
@@ -95,8 +96,10 @@ func fileExists(path string) bool {
 }
 
 // settleSQLiteTarget confirms that a completed backup target has no
-// non-empty WAL or rollback journal, tightens permissions to 0600, and
-// optionally re-runs a read-only integrity check.
+// non-empty WAL or rollback journal and optionally re-runs a read-only
+// integrity check. It does not change target permissions: a new target is
+// already created with 0600 by precreateSQLiteTarget, and an existing target
+// keeps the permissions its owner configured.
 func settleSQLiteTarget(path string, verify bool) error {
 	if nonEmptyFile(path + "-journal") {
 		return errors.New("target has a non-empty rollback journal")
@@ -108,9 +111,6 @@ func settleSQLiteTarget(path string, verify bool) error {
 	}
 	if nonEmptyFile(path+"-wal") || nonEmptyFile(path+"-journal") {
 		return errors.New("target still depends on a non-empty sidecar")
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("tighten target permissions: %w", err)
 	}
 	if verify {
 		if err := quickCheckSQLite(path); err != nil {

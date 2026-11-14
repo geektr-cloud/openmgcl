@@ -53,7 +53,7 @@ resource "terraform_data" "hello" {
 printf '.terraform/\nmgcl.db*\nbackup/\n' > .gitignore
 ```
 
-`.mgcl.yaml` 不忽略：它是项目配置，应该提交。里面只放配置和路径；示例 `token` 只是仅 loopback 使用的本地开发 token，真实凭据、Secret value 和私钥内容都不写入 YAML。
+`.mgcl.yaml` 不忽略：它是项目配置，应该提交。里面只放配置和路径；真实凭据、Secret value 和私钥内容都不写入 YAML。
 
 ## 2. 一份 `.mgcl.yaml` 管住项目配置
 
@@ -63,7 +63,6 @@ printf '.terraform/\nmgcl.db*\nbackup/\n' > .gitignore
 # .mgcl.yaml
 db: mgcl.db
 encryption_key_file: /home/you/.ssh/id_ed25519
-token: dev-token
 backup_to:
   - sqlite:backup/mgcl.db
 ```
@@ -74,7 +73,7 @@ mkdir -p backup
 
 - `db` 没有默认值，必须配；相对路径按 Git 根目录解析。
 - `encryption_key_file` 只写路径，不写私钥内容；换成你的实际路径。
-- `token` 是 OpenTofu cloud block 启动时要求的 Bearer token；示例值是仅 loopback 使用的本地开发 token，不是真实凭据，可以提交。真实凭据、Secret value 和私钥内容不要写进 YAML。
+- `token` 不需要配置：每次 `mgcl run -- tofu ...` 都自动生成全新 token，只用于本次子进程和服务，不打印。常驻 `mgcl run` 同样自动生成，并在启动后打印一次，供外部 OpenTofu 配置。
 - mgcl 只在 Git 工作树内读取 `<git-root>/.mgcl.yaml`，在子目录运行也读根目录这一份。
 - 完整配置字段见 [README 配置](README.md#配置)。
 
@@ -191,7 +190,7 @@ mgcl run -- tofu apply -auto-approve
 
 `dev_overrides` 路径会跳过 `tofu init`；需要 init 时改用 filesystem mirror。`dev_overrides` 只能通过 `TF_CLI_CONFIG_FILE` 交给 tofu；`mgcl run` 会保留这份内容并追加本地服务的 host block。provider 需要 OpenTofu >=1.11。
 
-只有 `mgcl run -- <command>` 会签发 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`；常驻 `mgcl run` 没有 token。Secret 每次 plan/apply 由 provider 重新读取，所以更新 Secret 后下一条命令能读到新值。
+只有 `mgcl run -- <command>` 会签发 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`；常驻 `mgcl run` 不签发 provider token。TACOS 用户 token 两种模式都会自动生成：子进程模式只写进本次临时 CLI config、不打印，常驻模式在启动后打印一次。Secret 每次 plan/apply 由 provider 重新读取，所以更新 Secret 后下一条命令能读到新值。
 
 ## 6. 改配置，再 apply
 
@@ -233,9 +232,9 @@ rm -f mgcl.db mgcl.db-wal mgcl.db-shm
 
 ## 记住四件事
 
-1. **`.mgcl.yaml` 可以提交**：只放配置和路径；示例 `token` 只是仅 loopback 使用的本地开发 token。真实凭据和 Secret value 用 `mgcl secret` 写进加密的 `mgcl.db`，私钥内容永远不进仓库。
+1. **`.mgcl.yaml` 可以提交**：只放配置和路径；真实凭据和 Secret value 用 `mgcl secret` 写进加密的 `mgcl.db`，私钥内容永远不进仓库。
 2. **`mgcl.db` 就是 state 和 bootstrap Secret**：不要提交到 git，备份和删除都要像对待 `terraform.tfstate` 一样谨慎。私钥丢失后 state 和 Secret 都无法恢复，备份时必须同时备份私钥。
-3. **每条 `mgcl run -- ...` 都是临时服务**：在同一个项目目录、用同一个 `mgcl.db`，state 和 Secret 就连续。provider token 只在该子进程存活期间有效。
+3. **每条 `mgcl run -- ...` 都是临时服务**：在同一个项目目录、用同一个 `mgcl.db`，state 和 Secret 就连续。自动生成的用户 token 和 provider token 都只在本次 run 存活期间有效。
 4. **mgcl 只做 state 存储和 bootstrap Secret**：provider 只提供 bootstrap Secret，不导出 outputs；也没有远程 runs、variables、策略、团队权限等协作功能。provider 尚未发布 Registry 时用 `dev_overrides`。
 
 ## 补充：如果用的是 remote backend

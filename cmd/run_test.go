@@ -284,6 +284,14 @@ func TestPrepareCLIConfigMergesExisting(t *testing.T) {
 	}
 	defer cleanup()
 
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("temporary config mode = %o, want 600", got)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -293,6 +301,9 @@ func TestPrepareCLIConfigMergesExisting(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `host "127.0.0.1:1217" {`) {
 		t.Errorf("temporary config missing host block:\n%s", data)
+	}
+	if !strings.Contains(string(data), `token = "secret"`) {
+		t.Errorf("temporary config missing current token:\n%s", data)
 	}
 
 	cleanup()

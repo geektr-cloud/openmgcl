@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -45,6 +47,12 @@ will be shut down when the command exits. If no command is specified, the
 server runs until SIGINT/SIGTERM; a command-less run never issues a provider
 token.
 
+When no TACOS user token is configured, mgcl generates a fresh random token for
+each run. A run with a child writes it only into the temporary CLI config and
+never prints it. A command-less run prints it once to stderr after the listening
+line so external OpenTofu clients can be configured. The token is valid only for
+the lifetime of this run.
+
 Listening on anything other than the literal host 127.0.0.1 publishes state
 and secrets. It requires a TTY confirmation or the exact flag
 --yes-i-know-it-will-publish-state-and-secrets.
@@ -57,7 +65,7 @@ Flags:
   -h, --host                  Listen address (default "127.0.0.1:1217")
   -s, --server                Base URL for Terraform (default derived from host)
   -d, --db                    SQLite database path (required)
-  -t, --token                 Bearer token for API auth (empty = no auth)
+  -t, --token                 Bearer token for API auth (default: generated per run)
       --encryption-key-file   SSH Ed25519 private key (default "~/.ssh/id_ed25519")
       --backup-to             Backup destination; repeatable (sqlite:<path> or path:<path>)
       --yes-i-know-it-will-publish-state-and-secrets
@@ -274,6 +282,30 @@ func prepareCLIConfig(serverURL, hostname, token string) (path string, cleanup f
 	}
 
 	return f.Name(), func() { os.Remove(f.Name()) }, nil
+}
+
+// generateRunToken returns a fresh TACOS user token. The token is random per
+// run, URL-safe, and never derived from the provider session or persisted.
+func generateRunToken() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", errors.New("generate access token")
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// resolveRunToken keeps an explicitly configured token and generates a new one
+// otherwise. generated reports whether the caller must treat the token as this
+// run's ephemeral secret.
+func resolveRunToken(configured string, generate func() (string, error)) (token string, generated bool, err error) {
+	if configured != "" {
+		return configured, false, nil
+	}
+	token, err = generate()
+	if err != nil {
+		return "", false, err
+	}
+	return token, true, nil
 }
 
 // runOptions is the effective configuration for the run command after parsing
@@ -601,6 +633,16 @@ func runRun(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 
+	// A configured token keeps its fixed value. Otherwise each run gets a fresh
+	// random token: a run with a child passes it only through the temporary CLI
+	// config, while a command-less run prints it after listening so external
+	// clients can use it.
+	tokenGenerated := false
+	opts.token, tokenGenerated, err = resolveRunToken(opts.token, generateRunToken)
+	if err != nil {
+		return err
+	}
+
 	// Resolve and validate backup destinations before loading the key or
 	// opening the database. Path destinations are probed here as well.
 	backupSpecs, backupBase, err := opts.backupDestinations(config, projectRoot)
@@ -709,6 +751,12 @@ func runRun(cmd *cobra.Command, args []string) (retErr error) {
 
 	// Server is ready since listener is already bound
 	fmt.Fprintf(os.Stderr, "MgCl server listening on %s\n", listener.Addr())
+	if tokenGenerated && len(opts.command) == 0 {
+		// Only the command-less run needs the operator to copy the generated
+		// token into an external OpenTofu CLI config. A run with a child
+		// already receives it through the private temporary config.
+		fmt.Fprintf(os.Stderr, "MgCl access token: %s\n", opts.token)
+	}
 	sessionStarted = true
 
 	var providerToken string

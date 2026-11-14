@@ -91,6 +91,10 @@ _Avoid_: secret version, key-value file
 保护单个 Secret 全部 KV 的独立数据密钥。它与 State Lineage 的 Lineage Key 完全独立，绝不共用；首版每把 Secret DEK 只有一个 Recipient，且不轮换。
 _Avoid_: Lineage Key, state key
 
+**User token**:
+`mgcl run` 服务用于 TACOS API 的 Bearer 凭据。未显式配置时每次 run 生成新的随机值：子进程 run 只写入临时 CLI config、不打印；常驻 run 在监听后向 stderr 打印一次。它与 Provider session 完全独立。
+_Avoid_: provider token, MGCL_TOKEN（环境变量名，不是概念）
+
 **Provider session**:
 `mgcl run` 为每次子进程启动签发的短期、只读凭证，只能读取当前数据库里的 Secret，不能读写 TACOS state 或执行管理操作。它不同于用户 Bearer token 和 SSH passphrase。
 _Avoid_: MGCL_TOKEN, user token

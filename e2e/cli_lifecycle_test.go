@@ -215,17 +215,37 @@ func TestCLIChildExitCodeAndTempConfigCleanup(t *testing.T) {
 	}
 	dbPath := filepath.Join(dir, "mgcl.db")
 	keyPath := writeTestIdentity(t)
+	configCopy := filepath.Join(dir, "captured.tfrc")
+	modeFile := filepath.Join(dir, "captured.mode")
 
-	code, out := runMgclSync(t, bin, dir, baseEnv("TMPDIR="+tmpDir),
+	childScript := `cp "$TF_CLI_CONFIG_FILE" "$CAPTURE_CONFIG" && ` +
+		`stat -c '%a' "$TF_CLI_CONFIG_FILE" > "$CAPTURE_MODE" && exit 7`
+	code, out := runMgclSync(t, bin, dir, baseEnv("TMPDIR="+tmpDir,
+		"CAPTURE_CONFIG="+configCopy,
+		"CAPTURE_MODE="+modeFile),
 		"run", "--host", "127.0.0.1:0", "--db", dbPath,
 		"--token", "secret-token", "--encryption-key-file", keyPath,
-		"--", "sh", "-c", "exit 7")
+		"--", "sh", "-c", childScript)
 
 	if code != 7 {
 		t.Fatalf("exit code = %d, want 7\n%s", code, out)
 	}
 	if strings.Contains(out, "Error:") || strings.Contains(out, "Usage:") {
 		t.Fatalf("expected child exit produced CLI error output:\n%s", out)
+	}
+	data, err := os.ReadFile(configCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `token = "secret-token"`) {
+		t.Fatalf("temporary CLI config does not contain the explicit token:\n%s", data)
+	}
+	mode, err := os.ReadFile(modeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(mode)) != "600" {
+		t.Fatalf("temporary CLI config mode = %q, want 600", strings.TrimSpace(string(mode)))
 	}
 	matches, err := filepath.Glob(filepath.Join(tmpDir, "mgcl-tofu-*.tfrc"))
 	if err != nil {

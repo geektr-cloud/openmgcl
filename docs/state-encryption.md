@@ -11,7 +11,7 @@ OpenMgCl 用于从零启动整套基础设施，目标场景是本地手动、�
 - 强制加密 `state_versions.state`、`json_state`、`json_state_outputs`；
 - mgcl 在内存中解密，现有 API 对 OpenTofu 返回相同明文；
 - workspace/organization、serial、lineage、MD5、状态、时间戳和密钥元数据保持明文；
-- 现有 Bearer token、foreign upload/download 和锁语义不变；
+- 认证仍要求用户 Bearer token（`mgcl run` 可自动生成），foreign upload/download 和锁语义不变；
 - 不保护运行中的进程、已解密 HTTP 响应或私钥被本机攻击者读取的场景；
 - 不防能改写 SQLite 的主动攻击者替换密钥元数据；wrapped key 没有额外的本地签名/MAC。
 

@@ -184,9 +184,19 @@ value 有三种来源，必须互斥：
 
 ## 5. `mgcl run` 与 provider session
 
+### 5.0 用户 token
+
+`mgcl run` 的 TACOS 用户 Bearer token 与 provider session 完全独立。未显式配置时，每次 run 都用 `crypto/rand` 生成新的至少 32-byte token，base64url 无 padding；不落库、不写日志：
+
+- `mgcl run -- <command>` 只把 token 写入本次临时 CLI config 的 `credentials`，不打印；文件 0600，子进程退出后删除，服务随之关闭；
+- 常驻 `mgcl run` 在 listener 启动并输出 `MgCl server listening on ...` 后，向 stderr 打印一次 `MgCl access token: <token>`，供外部 OpenTofu CLI config 使用；shutdown 后服务关闭，token 失效；
+- 显式 `--token`、`MGCL_TOKEN` 或 `.mgcl.yaml` 的 `token` 保持固定值，不自动生成，也不因自动生成而打印。
+
+空 token 不再表示免认证：TACOS 认证路由始终要求与当前 run token 匹配的 Bearer。`mgcl secret` 离线命令仍不需要用户 token。
+
 ### 5.1 生成与注入
 
-首版 ephemeral provider 只支持 `mgcl run -- <command>` 的子进程。常驻 `mgcl run`（无子进程）不签发、不打印 token，因此不能使用 provider；首版不增加常驻 token 获取接口。
+首版 ephemeral provider 只支持 `mgcl run -- <command>` 的子进程。常驻 `mgcl run`（无子进程）不签发、不打印 provider token，因此不能使用 provider；首版不增加常驻 provider token 获取接口。
 
 当 `mgcl run` 启动子进程时，为本次子进程生成一个 provider session：
 
@@ -219,7 +229,7 @@ provider token 不能：
 - 读写 state，或执行任何管理操作；
 - 在子进程退出或 server shutdown 后继续使用。
 
-TACOS API 的既有认证行为不变；provider token 不是用户 token，不扩大也不替代用户 token 的权限。
+TACOS API 始终要求用户 Bearer token，空 token 不绕过认证；provider token 不是用户 token，不扩大也不替代用户 token 的权限。
 
 撤销后的表现分两种：server 仍在监听时，旧 token 的 `secrets:read` 返回 401；进程退出后端口已关闭，客户端得到的是连接失败，而不是 HTTP 401。两者都表示 token 已失效，但测试和日志不应混为一谈。
 
@@ -493,7 +503,7 @@ provider "aws" {
 
 独立 provider 仓库为 `github.com/geektr-cloud/terraform-provider-mgcl`，provider local name 为 `mgcl`。
 
-- 首版只在 `mgcl run -- <command>` 子进程中工作；常驻 `mgcl run` 不签发 token，因此不能使用 provider；
+- 首版只在 `mgcl run -- <command>` 子进程中工作；常驻 `mgcl run` 不签发 provider token，因此不能使用 provider；
 - 只提供 ephemeral resource `mgcl_secret`，不注册同名普通 resource 或 data source；
 - `provider "mgcl" {}` 不需要必填参数；从 `MGCL_PROVIDER_ENDPOINT` 和 `MGCL_PROVIDER_TOKEN` 读取连接信息；Secret value 不来自环境；
 - provider `Configure` 不访问网络；缺少 endpoint/token 时允许 `tofu validate` 通过，由 Open 返回清晰错误；
@@ -709,7 +719,7 @@ Provider session 与 API：
 - 存储：`internal/tacos/secret_store.go`、`internal/tacos/secret_envelope.go`。schema 为 `secrets` / `secret_deks` / `secret_kvs`，与 TACOS state 共用 `mgcl.db`、SSH identity 和迁移，但 label/AAD/fingerprint 独立。写路径使用 `BEGIN IMMEDIATE`、唯一约束、外键级联和事务。
 - CLI：`cmd/secret.go`、`cmd/secret_output.go`。`list/show/create/set/get/unset/delete`，固定 flag、配置优先级、TTY 无回显、`--stdin`、`--yes`、备份接入和缺失 DB 边界。
 - Provider session：`internal/tacos/provider_session.go`、`internal/tacos/provider.go`。`POST /api/mgcl/v1/secrets:read`，8 KiB 请求限制、`Cache-Control: no-store`、200/400/401/404/405/413/500，token 只存 SHA-256 摘要；provider token 被 TACOS 路由拒绝，用户 token 不能读 Secret。
-- `mgcl run`：只对有子进程的运行签发 session，注入 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`，endpoint 从实际 listener 推导；非 loopback 安全门在加载私钥、打开 DB、监听前执行。
+- `mgcl run`：只对有子进程的运行签发 provider session，注入 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`，endpoint 从实际 listener 推导；用户 TACOS token 未配置时每次 run 自动生成，子进程模式只写入临时 CLI config，常驻模式在监听后打印一次；非 loopback 安全门在加载私钥、打开 DB、监听前执行。
 - 客户端：`pkg/providerapi`（stdlib-only、有限超时、不跟随重定向、2 MiB 响应上限）；`cmd/mgcl` 安装入口与根入口共用 `cmd.Main`。
 
 依赖外部仓库：

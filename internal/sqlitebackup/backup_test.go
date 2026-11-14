@@ -493,13 +493,6 @@ func TestPathCopyOnlyOnShutdown(t *testing.T) {
 	waitForValue(t, target, `SELECT COUNT(*) FROM items`, "2")
 	waitForValue(t, target, `SELECT value FROM items ORDER BY id DESC LIMIT 1`, "shutdown-only")
 
-	fi, err := os.Stat(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("target mode = %o, want 600", fi.Mode().Perm())
-	}
 	if _, err := os.Stat(source); err != nil {
 		t.Fatalf("source disappeared: %v", err)
 	}
@@ -512,6 +505,46 @@ func TestPathCopyOnlyOnShutdown(t *testing.T) {
 		if strings.Contains(entry.Name(), "mgcl-tmp") || strings.Contains(entry.Name(), "mgcl-probe") {
 			t.Fatalf("temporary file left behind: %s", entry.Name())
 		}
+	}
+}
+
+func TestPathBackupPermissionsFollowUmask(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "mgcl.db")
+	db := createSource(t, source)
+
+	// A 0666 reference in the target's directory shows the mode this process
+	// gets from the umask and any default ACL. The path temp file and final
+	// target must follow the same rules instead of being forced to 0600.
+	reference := filepath.Join(dir, "reference")
+	refFile, err := os.OpenFile(reference, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o666)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := refFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	refInfo, err := os.Stat(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := refInfo.Mode().Perm()
+
+	target := filepath.Join(dir, "backup.db")
+	m := mustManager(t, source, []string{"path:" + target})
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Shutdown(db); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != want {
+		t.Fatalf("path target mode = %04o, want %04o from a 0666 reference (umask/default ACL decide, not a fixed 0600)", got, want)
 	}
 }
 
@@ -799,6 +832,52 @@ func TestManagerStartTwiceFails(t *testing.T) {
 	if err := m.Shutdown(db); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestSQLiteTargetExistingPermissionsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "mgcl.db")
+	db := createSource(t, source)
+
+	target := filepath.Join(dir, "backup.db")
+	old := openTestDB(t, target)
+	if _, err := old.Exec(`CREATE TABLE old (id INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	assertMode := func(stage string) {
+		t.Helper()
+		fi, err := os.Stat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o640 {
+			t.Errorf("%s: target mode = %o, want 640", stage, fi.Mode().Perm())
+		}
+	}
+
+	m := mustManager(t, source, []string{"sqlite:" + target})
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForValue(t, target, `SELECT value FROM items WHERE id = 1`, "initial")
+	assertMode("initial backup")
+
+	insertItem(t, db, "synced")
+	m.MarkDirty()
+	waitForValue(t, target, `SELECT value FROM items ORDER BY id DESC LIMIT 1`, "synced")
+	assertMode("background sync")
+
+	if err := m.Shutdown(db); err != nil {
+		t.Fatal(err)
+	}
+	assertMode("shutdown")
 }
 
 func TestPrecreateSQLiteTargetPermissions(t *testing.T) {

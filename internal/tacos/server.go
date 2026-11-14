@@ -15,7 +15,7 @@ import (
 type Server struct {
 	store     *Store
 	serverURL string // base URL without trailing slash, e.g. "http://127.0.0.1:1217"
-	token     string // empty = no auth
+	token     string // user Bearer token; empty means every authenticated route rejects
 	providers *ProviderSessions
 
 	// afterProviderDecrypt is a deterministic test hook used to revoke a
@@ -23,9 +23,10 @@ type Server struct {
 	afterProviderDecrypt func()
 }
 
-// NewRouter returns the complete TACOS state.v2 HTTP handler. An optional
-// provider session set enables the ephemeral Secret read API; without it that
-// endpoint always returns 401.
+// NewRouter returns the complete TACOS state.v2 HTTP handler. The user token is
+// always required for authenticated routes; an empty token does not disable
+// authentication. An optional provider session set enables the ephemeral Secret
+// read API; without it that endpoint always returns 401.
 func NewRouter(store *Store, serverURL, token string, providers ...*ProviderSessions) http.Handler {
 	s := &Server{
 		store:     store,
@@ -59,11 +60,10 @@ func buildRouter(s *Server) http.Handler {
 	r.Route("/api/v2", func(r chi.Router) {
 		r.Get("/ping", s.pingHandler)
 
-		// Auth-required routes
+		// Auth-required routes. The token is always required; an empty
+		// configured token does not turn authentication off.
 		r.Group(func(r chi.Router) {
-			if s.token != "" {
-				r.Use(s.bearerAuthMiddleware)
-			}
+			r.Use(s.bearerAuthMiddleware)
 
 			// Organizations
 			r.Get("/organizations/{org}/entitlement-set", s.entitlementSetHandler)

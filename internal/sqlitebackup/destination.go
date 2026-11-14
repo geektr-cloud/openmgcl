@@ -288,10 +288,12 @@ func checkTargetSidecars(path string, src sourceInfo) error {
 }
 
 // probePath verifies that the target directory supports create, write, fsync,
-// close, and remove without touching the real target file.
+// close, and remove without touching the real target file. The probe file is
+// created with mode 0666 so the process umask and the directory's default ACL
+// decide its permissions; no chmod or chown is applied.
 func probePath(d Destination) error {
 	dir := filepath.Dir(d.Path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(d.Path)+".mgcl-probe-*")
+	f, err := createTempFile(dir, "."+filepath.Base(d.Path)+".mgcl-probe-*")
 	if err != nil {
 		return fmt.Errorf("probe directory %q: %w", dir, err)
 	}

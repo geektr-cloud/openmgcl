@@ -12,9 +12,17 @@ import (
 	"testing"
 )
 
+// testUserToken is the default Bearer token used by tests that only need an
+// authenticated server. Authentication is always required, including when a
+// server is constructed with an empty token.
+const testUserToken = "test-user-token"
+
 // helper to create a test server with a temp SQLite DB.
 func newTestServer(t *testing.T, token string) (*httptest.Server, *Store) {
 	t.Helper()
+	if token == "" {
+		token = testUserToken
+	}
 	f, err := os.CreateTemp("", "tacos-test-*.db")
 	if err != nil {
 		t.Fatal(err)
@@ -41,6 +49,9 @@ func newTestServer(t *testing.T, token string) (*httptest.Server, *Store) {
 
 func get(t *testing.T, url string, token string) *http.Response {
 	t.Helper()
+	if token == "" {
+		token = testUserToken
+	}
 	req, _ := http.NewRequest("GET", url, nil)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -52,8 +63,21 @@ func get(t *testing.T, url string, token string) *http.Response {
 	return resp
 }
 
+func getWithoutAuth(t *testing.T, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("GET", url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 func postJSON(t *testing.T, url string, body any, token string) *http.Response {
 	t.Helper()
+	if token == "" {
+		token = testUserToken
+	}
 	var buf bytes.Buffer
 	json.NewEncoder(&buf).Encode(body)
 	req, _ := http.NewRequest("POST", url, &buf)
@@ -517,7 +541,7 @@ func TestAuthentication(t *testing.T) {
 	defer ts.Close()
 
 	// No auth header → 401
-	resp := get(t, ts.URL+"/api/v2/organizations/dev/entitlement-set", "")
+	resp := getWithoutAuth(t, ts.URL+"/api/v2/organizations/dev/entitlement-set")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("no auth: status = %d, want 401", resp.StatusCode)
@@ -569,6 +593,48 @@ func TestAuthentication(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("download without auth: status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestEmptyTokenDoesNotBypassAuthentication(t *testing.T) {
+	f, err := os.CreateTemp("", "tacos-empty-token-*.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	t.Cleanup(func() { os.Remove(f.Name()) })
+
+	store, err := Open(f.Name(), testIdentity(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	ts := httptest.NewServer(NewRouter(store, "http://placeholder", ""))
+	defer ts.Close()
+
+	// A missing header and any bearer value must both be rejected when the
+	// configured token is empty. Empty never means "authentication disabled".
+	resp := getWithoutAuth(t, ts.URL+"/api/v2/organizations/dev/entitlement-set")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no header: status = %d, want 401", resp.StatusCode)
+	}
+
+	resp = get(t, ts.URL+"/api/v2/organizations/dev/entitlement-set", "anything")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("arbitrary token: status = %d, want 401", resp.StatusCode)
+	}
+
+	// Discovery and ping stay unauthenticated by design.
+	resp, err = http.Get(ts.URL + "/api/v2/ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ping status = %d, want 200", resp.StatusCode)
 	}
 }
 

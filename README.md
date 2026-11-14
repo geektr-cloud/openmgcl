@@ -114,11 +114,11 @@ terraform {
 ```
 
 ```bash
-mgcl run --db ./mgcl.db --token dev-token -- \
+mgcl run --db ./mgcl.db -- \
   sh -c 'tofu init -input=false && tofu apply -auto-approve -input=false'
 ```
 
-`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程，命令结束后关闭服务。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。子进程退出码原样作为 `mgcl` 退出码；被信号终止时为 `128+signal`。
+`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程，命令结束后关闭服务。token 不需要配置：每次运行自动生成一个全新随机 token，只写进本次临时 CLI config，不打印。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。子进程退出码原样作为 `mgcl` 退出码；被信号终止时为 `128+signal`。
 
 如果使用 `remote` backend，OpenTofu 要求显式 `hostname`：
 
@@ -139,10 +139,16 @@ terraform {
 ### 方式二：常驻服务 + 手写 CLI config
 
 ```bash
-mgcl run --host 127.0.0.1:1217 --db ./mgcl.db --token dev-token
+mgcl run --host 127.0.0.1:1217 --db ./mgcl.db
 ```
 
-另开一个终端，写 `tofu.rc`：
+未指定 token 时，常驻 `mgcl run` 也会自动生成一个本次进程有效的 token，并在 `MgCl server listening on ...` 之后向 stderr 打印一次：
+
+```text
+MgCl access token: <random-token>
+```
+
+需要稳定 token 时再显式传 `--token`；显式 token 不会打印。另开一个终端，写 `tofu.rc`：
 
 ```hcl
 host "127.0.0.1:1217" {
@@ -154,7 +160,7 @@ host "127.0.0.1:1217" {
 }
 
 credentials "127.0.0.1:1217" {
-  token = "dev-token"
+  token = "<MgCl access token>"
 }
 ```
 
@@ -179,7 +185,7 @@ MGCL_PROVIDER_ENDPOINT=http://127.0.0.1:<实际端口>
 MGCL_PROVIDER_TOKEN=<一次性随机 token>
 ```
 
-常驻 `mgcl run`（没有子进程）不签发、不打印 token。token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。它只能调用 `POST /api/mgcl/v1/secrets:read`，不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 Secret API。endpoint 从实际 listener 推导，不使用 `--server`。
+常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。它只能调用 `POST /api/mgcl/v1/secrets:read`，不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 Secret API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
 
 provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后用 `dev_overrides`：
 
@@ -229,7 +235,7 @@ provider "aws" {
 | `--host`, `-h` | `127.0.0.1:1217` | 监听地址；`127.0.0.1:0` 自动选端口 |
 | `--server`, `-s` | 从 `--host` 推导 | 对外 base URL，用于 discovery 和上传/下载链接 |
 | `--db`, `-d` | 无（必填） | SQLite 路径；WAL 模式，会生成 `-wal` / `-shm` |
-| `--token`, `-t` | 空 | Bearer token；为空表示不认证 |
+| `--token`, `-t` | 每次 run 自动生成 | TACOS Bearer token；子进程 run 自动生成且不打印，常驻 run 自动生成并在启动后打印一次；显式配置保持固定值且不打印 |
 | `--encryption-key-file` | `~/.ssh/id_ed25519` | 强制加密使用的 Ed25519 OpenSSH 私钥 |
 | `--backup-to` | 无 | 备份目标；可重复，`sqlite:<path>` 或 `path:<path>`；出现时整体替换 YAML `backup_to`；`mgcl run` 和 `mgcl secret` 写命令使用 |
 
@@ -240,14 +246,13 @@ provider "aws" {
 host: "127.0.0.1:1217"
 server: "http://127.0.0.1:1217"
 db: "mgcl.db"
-token: "dev-token"
 encryption_key_file: "/home/you/.ssh/id_ed25519"
 backup_to:
   - "sqlite:/srv/mgcl-backup/mgcl.db"
   - "path:/mnt/no-locks/backup/mgcl.db"
 ```
 
-`db` 来自 `.mgcl.yaml` 时，相对路径按 Git 根目录解析；来自 `--db` 或 `MGCL_DB` 时，相对路径按进程当前工作目录解析。绝对路径保持不变。`.mgcl.yaml` 可能包含 token，默认应加入 `.gitignore`。
+`db` 来自 `.mgcl.yaml` 时，相对路径按 Git 根目录解析；来自 `--db` 或 `MGCL_DB` 时，相对路径按进程当前工作目录解析。绝对路径保持不变。`.mgcl.yaml` 只放配置和路径，不要写真实凭据、Secret value、私钥内容或 token。
 
 也可以使用环境变量 `MGCL_HOST`、`MGCL_SERVER`、`MGCL_DB`、`MGCL_TOKEN`、`MGCL_ENCRYPTION_KEY_FILE`。`MGCL_ENCRYPTION_KEY_PASSPHRASE` 只从环境或 TTY 读取，不能写进配置。
 
@@ -267,7 +272,7 @@ mgcl run --db ./mgcl.db \
 两种 scheme 不能互换：
 
 - `sqlite:<path>`：启动时先做一次完整的 SQLite Online Backup，之后每次成功写提交都会唤醒唯一后台 worker 合并同步；干净关停前会 drain 最后一轮。目标要求文件系统支持 SQLite 锁。
-- `path:<path>`：启动时只在目标同目录做 0600 可写探测；运行中不复制。停止写、drain、checkpoint 并关闭主库后，才把自包含的主文件复制到同目录临时文件并 rename 覆盖。目标不依赖 `-wal`/`-shm`/`-journal`，适合不支持 SQLite 锁的挂载。
+- `path:<path>`：启动时只在目标同目录做可写探测（探测文件权限由 umask/默认 ACL 决定）；运行中不复制。停止写、drain、checkpoint 并关闭主库后，才把自包含的主文件复制到同目录临时文件并 rename 覆盖。目标不依赖 `-wal`/`-shm`/`-journal`，适合不支持 SQLite 锁的挂载。临时文件和最终目标以 0666 请求创建，实际权限由 umask/目录默认 ACL 决定，应用不改写权限。
 
 备份失败 fail-closed：启动校验、探测或初始备份失败不会启动服务；运行中 sqlite 同步失败会停止接受新写并终止子进程；关停时在子进程退出或信号处理完成后，先关闭写 gate、等待在途写完成，再 drain/checkpoint/copy，path 复制失败同样令命令失败。子进程自己的非零退出码会保留；子进程成功但备份失败时退出 1；备份主动终止 run 时不会伪装成 `128+signal`。已经提交的源事务不会回滚。
 
@@ -293,7 +298,7 @@ TACOS `state.v2` 子集与 provider Secret API：
 - `GET /api/v2/state-versions/{id}/download`（免认证）
 - `POST /api/mgcl/v1/secrets:read`（provider session token；`Cache-Control: no-store`）
 
-`--token` 非空时，除 discovery、ping 和 foreign upload/download 外的 TACOS API 都需要 `Authorization: Bearer <token>`。provider session token 只接受于 `secrets:read`，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 `secrets:read`。没有活跃 provider session 时该端点一律 401。
+TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Authorization: Bearer <token>`；空 token 不表示免认证。子进程 `mgcl run --` 自动把当次 token 写入临时 CLI config，常驻 run 自动生成并打印一次，显式 `--token`/`MGCL_TOKEN`/YAML token 保持固定值。provider session token 只接受于 `secrets:read`，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 `secrets:read`。没有活跃 provider session 时该端点一律 401。
 
 ## 限制
 
@@ -312,7 +317,7 @@ TACOS `state.v2` 子集与 provider Secret API：
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
 - 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。
-- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 token。token 是短期只读凭证，不是 TACOS 用户 token，也不能管理 Secret。
+- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期只读凭证，不是 TACOS 用户 token，也不能管理 Secret。
 - Secret 写入与 `mgcl run` 共用同一个 `mgcl.db` 和备份层；同一数据库不应同时运行多个写会话。备份不含明文 value，恢复仍只依赖 `mgcl.db` 和私钥。
 - 非 loopback provider endpoint 或 serverURL 需要显式确认。provider endpoint 是 HTTP；`--server` 的加密取决于其 scheme。
 - 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。

@@ -29,8 +29,10 @@ func syncDirectory(dir string) error {
 }
 
 // copyPathToDestination copies the closed, checkpointed main database to a
-// path target via a unique 0600 temp file in the same directory and an atomic
-// rename. The destination format is never opened by SQLite.
+// path target via a unique temp file in the same directory and an atomic
+// rename. The temp file is created with mode 0666 so the process umask and the
+// directory's default ACL decide its permissions; the application never
+// changes them. The destination format is never opened by SQLite.
 func (m *Manager) copyPathToDestination(d Destination) error {
 	if BeforePathCopy != nil {
 		if err := BeforePathCopy(); err != nil {
@@ -53,17 +55,13 @@ func (m *Manager) copyPathToDestination(d Destination) error {
 	}
 
 	dir := filepath.Dir(d.Path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(d.Path)+".mgcl-tmp-*")
+	tmp, err := createTempFile(dir, "."+filepath.Base(d.Path)+".mgcl-tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpName) }
 
-	if err := tmp.Chmod(0o600); err != nil {
-		cleanup()
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
 	n, err := io.Copy(tmp, src)
 	if err != nil {
 		cleanup()

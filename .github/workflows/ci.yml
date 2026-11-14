@@ -35,7 +35,7 @@ jobs:
       - name: Setup OpenTofu
         uses: opentofu/setup-opentofu@v2
         with:
-          tofu_version: latest
+          tofu_version: 1.13.9
 
       - name: Test
         run: go test ./...

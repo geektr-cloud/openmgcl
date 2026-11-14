@@ -312,6 +312,134 @@ func TestPrepareCLIConfigMergesExisting(t *testing.T) {
 	}
 }
 
+func TestPrepareCLIConfigInheritsDefaultUserConfig(t *testing.T) {
+	home := t.TempDir()
+	userConfig := `provider_installation {
+  dev_overrides {
+    "geektr-cloud/mgcl" = "/opt/mgcl-provider/bin"
+  }
+  direct {}
+}
+`
+	if err := os.WriteFile(filepath.Join(home, ".tofurc"), []byte(userConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("TF_CLI_CONFIG_FILE", "")
+
+	path, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, `"geektr-cloud/mgcl" = "/opt/mgcl-provider/bin"`) {
+		t.Errorf("temporary config lost the default ~/.tofurc dev_overrides:\n%s", got)
+	}
+	if !strings.Contains(got, `host "127.0.0.1:1217" {`) {
+		t.Errorf("temporary config missing host block:\n%s", got)
+	}
+	if !strings.Contains(got, `token = "secret"`) {
+		t.Errorf("temporary config missing current token:\n%s", got)
+	}
+}
+
+func TestPrepareCLIConfigEnvOverridesDefaultUserConfig(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".tofurc"), []byte("# from home\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envConfig := filepath.Join(t.TempDir(), "env.tfrc")
+	if err := os.WriteFile(envConfig, []byte("# from env\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("TF_CLI_CONFIG_FILE", envConfig)
+
+	path, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.HasPrefix(got, "# from env\n") {
+		t.Errorf("TF_CLI_CONFIG_FILE was not read first:\n%s", got)
+	}
+	if strings.Contains(got, "# from home") {
+		t.Errorf("default ~/.tofurc leaked into config while TF_CLI_CONFIG_FILE was set:\n%s", got)
+	}
+}
+
+func TestPrepareCLIConfigMissingDefaultUserConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TF_CLI_CONFIG_FILE", "")
+
+	path, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", "")
+	if err != nil {
+		t.Fatalf("missing ~/.tofurc should not fail: %v", err)
+	}
+	defer cleanup()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), `host "127.0.0.1:1217" {`) {
+		t.Errorf("temporary config should contain only the generated host block:\n%s", data)
+	}
+}
+
+func TestPrepareCLIConfigUnreadableDefaultUserConfigFails(t *testing.T) {
+	home := t.TempDir()
+	userConfig := filepath.Join(home, ".tofurc")
+	if err := os.WriteFile(userConfig, []byte("# config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(userConfig, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(userConfig, 0o600) })
+	if _, err := os.ReadFile(userConfig); err == nil {
+		t.Skip("cannot make ~/.tofurc unreadable (running as root)")
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("TF_CLI_CONFIG_FILE", "")
+
+	if _, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", ""); err == nil {
+		cleanup()
+		t.Fatal("unreadable ~/.tofurc should fail")
+	} else if !strings.Contains(err.Error(), "read default OpenTofu CLI config") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestPrepareCLIConfigMissingExplicitFileFails(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".tofurc"), []byte("# from home\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("TF_CLI_CONFIG_FILE", filepath.Join(t.TempDir(), "missing.tfrc"))
+
+	if _, cleanup, err := prepareCLIConfig("http://127.0.0.1:1217", "127.0.0.1:1217", ""); err == nil {
+		cleanup()
+		t.Fatal("missing explicit TF_CLI_CONFIG_FILE should fail")
+	} else if !strings.Contains(err.Error(), "read TF_CLI_CONFIG_FILE") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 func TestTacosDiscovery(t *testing.T) {
 	tmpFile, err := os.CreateTemp("", "mgcl-test-*.db")
 	if err != nil {

@@ -42,10 +42,10 @@ and a TACOS state.v2 backend backed by SQLite.
 If a command is specified after --, it will be executed with TF_CLOUD_HOSTNAME
 and TF_CLI_CONFIG_FILE set up so OpenTofu can reach the local server, plus
 MGCL_PROVIDER_ENDPOINT and MGCL_PROVIDER_TOKEN for the ephemeral mgcl Secret
-provider. An existing TF_CLI_CONFIG_FILE is preserved and extended. The server
-will be shut down when the command exits. If no command is specified, the
-server runs until SIGINT/SIGTERM; a command-less run never issues a provider
-token.
+provider. The user's CLI config is preserved and extended: TF_CLI_CONFIG_FILE
+when set, otherwise the default ~/.tofurc. The server will be shut down when
+the command exits. If no command is specified, the server runs until
+SIGINT/SIGTERM; a command-less run never issues a provider token.
 
 When no TACOS user token is configured, mgcl generates a fresh random token for
 each run. A run with a child writes it only into the temporary CLI config and
@@ -250,17 +250,44 @@ func buildCLIConfig(existing, serverURL, hostname, token string) string {
 	return b.String()
 }
 
-// prepareCLIConfig writes a temporary OpenTofu CLI config that points hostname
-// at serverURL, preserving any existing TF_CLI_CONFIG_FILE content. The caller
-// must invoke cleanup after the child process exits.
-func prepareCLIConfig(serverURL, hostname, token string) (path string, cleanup func(), err error) {
-	existing := ""
+// readExistingCLIConfig returns the OpenTofu CLI config that mgcl extends.
+// TF_CLI_CONFIG_FILE wins when it is set. Otherwise mgcl inherits the default
+// user config (~/.tofurc) so settings such as provider_installation
+// dev_overrides keep working in the child process. A missing default config is
+// equivalent to an empty one; an unreadable one is an error.
+func readExistingCLIConfig() (string, error) {
 	if p := os.Getenv("TF_CLI_CONFIG_FILE"); p != "" {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return "", nil, fmt.Errorf("read TF_CLI_CONFIG_FILE %q: %w", p, err)
+			return "", fmt.Errorf("read TF_CLI_CONFIG_FILE %q: %w", p, err)
 		}
-		existing = string(data)
+		return string(data), nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// Without a home directory there is no default CLI config to inherit.
+		return "", nil
+	}
+	p := filepath.Join(home, ".tofurc")
+	data, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read default OpenTofu CLI config %q: %w", p, err)
+	}
+	return string(data), nil
+}
+
+// prepareCLIConfig writes a temporary OpenTofu CLI config that points hostname
+// at serverURL, preserving the user's CLI config (TF_CLI_CONFIG_FILE when set,
+// else the default ~/.tofurc). The caller must invoke cleanup after the child
+// process exits.
+func prepareCLIConfig(serverURL, hostname, token string) (path string, cleanup func(), err error) {
+	existing, err := readExistingCLIConfig()
+	if err != nil {
+		return "", nil, err
 	}
 
 	content := buildCLIConfig(existing, serverURL, hostname, token)

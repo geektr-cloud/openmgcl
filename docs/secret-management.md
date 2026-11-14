@@ -561,10 +561,10 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
 当前仓不采用 monorepo、provider 内嵌或模拟 registry。开发期在独立 provider 仓库中：
 
 1. 用 `go install`/`go build` 生成 `terraform-provider-mgcl` 二进制。
-2. 快速开发使用 `dev_overrides`：CLI config 把 `geektr-cloud/mgcl` 指向包含该二进制的目录。OpenTofu 会直接使用本地二进制，并对该 provider 跳过 `tofu init` 的安装/校验。
+2. 快速开发使用 `dev_overrides`：CLI config 把 `geektr-cloud/mgcl` 指向包含该二进制的目录（是目录，不是二进制文件本身）。OpenTofu 会直接使用本地二进制，并对该 provider 跳过 `tofu init` 的安装/校验。
 
    ```hcl
-   # dev.tfrc
+   # ~/.tofurc
    provider_installation {
      dev_overrides {
        "geektr-cloud/mgcl" = "/home/me/src/terraform-provider-mgcl/bin"
@@ -590,7 +590,7 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
    ```
 
    ```hcl
-   # dev.tfrc（filesystem mirror）
+   # dev.tfrc 或 ~/.tofurc（filesystem mirror）
    provider_installation {
      filesystem_mirror {
        path    = "/opt/tofu-mirror"
@@ -602,14 +602,13 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
    }
    ```
 
-4. 在 `mgcl run -- <command>` 场景必须显式设置 `TF_CLI_CONFIG_FILE`：
+4. `mgcl run -- <command>` 默认继承 OpenTofu 默认 CLI config `~/.tofurc`：
 
    ```bash
-   export TF_CLI_CONFIG_FILE=/path/to/dev.tfrc
    mgcl run --db ./mgcl.db -- tofu plan
    ```
 
-   mgcl 只从 `TF_CLI_CONFIG_FILE` 读取并合并现有 CLI config，不读取默认 `~/.tofurc`；仅依赖默认文件不会让 `provider_installation` 生效。
+   `mgcl run` 读取 `~/.tofurc` 的现有内容，写入临时 CLI config，再追加本地服务的 host block 和本次 run 的 token。显式设置 `TF_CLI_CONFIG_FILE` 时改为读取该文件，优先于默认 `~/.tofurc`；显式文件不存在仍然报错。默认 `~/.tofurc` 不存在等价于空配置，存在但不可读则报错。
 
 5. 用真实 OpenTofu >=1.11 跑 provider 合同测试和 e2e。
 6. 不实现本地 registry 服务：`dev_overrides` 覆盖未发布 provider 并跳过 `tofu init`，filesystem mirror 覆盖需要 `tofu init` 的集成路径。
@@ -670,7 +669,7 @@ Provider session 与 API：
 - 把 `mgcl_secret` 误用为普通 resource，或把 ephemeral 值用于不允许的普通参数时失败；
 - 非 loopback 安全门在真实 `mgcl run` 启动路径上生效，包括 `--host 127.0.0.1:0 --server http://<LAN-IP>/...` 组合；
 - token 失效和权限限制在 API 测试及真实进程生命周期中验证：子进程退出后、server shutdown 后均 401；
-- `dev_overrides` 路径跳过 `tofu init`；filesystem mirror 的 packed 或 unpacked 布局能完成真实 `tofu init`；`mgcl run -- ...` 通过显式 `TF_CLI_CONFIG_FILE` 使用这些配置；
+- `dev_overrides` 路径跳过 `tofu init`；filesystem mirror 的 packed 或 unpacked 布局能完成真实 `tofu init`；`mgcl run -- ...` 默认继承 `~/.tofurc` 中的这些配置，显式 `TF_CLI_CONFIG_FILE` 可覆盖默认文件；
 - e2e 使用临时生成的 0600 Ed25519 私钥，不依赖开发者真实 `~/.ssh/id_ed25519`、网络或固定 Home。
 
 通用检查：
@@ -725,6 +724,6 @@ Provider session 与 API：
 依赖外部仓库：
 
 - `github.com/geektr-cloud/terraform-provider-mgcl` 的 `mgcl_secret` ephemeral resource、Validate/Open/Close 和真实 OpenTofu e2e 已在独立仓实现；主仓不修改该仓库。
-- 未发布 OpenTofu Registry；开发期使用 `dev_overrides` 或 filesystem mirror，`mgcl run --` 通过显式 `TF_CLI_CONFIG_FILE` 使用对应配置。
+- 未发布 OpenTofu Registry；开发期使用 `dev_overrides` 或 filesystem mirror，`mgcl run --` 默认继承 `~/.tofurc`，显式 `TF_CLI_CONFIG_FILE` 优先。
 
 首版明确未实现：多 Recipient、DEK rotation/rewrap、历史、HTTP 管理 API、provider function/普通 data source/cloud variables、本地 registry。

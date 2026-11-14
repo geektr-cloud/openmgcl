@@ -256,6 +256,60 @@ func TestCLIChildExitCodeAndTempConfigCleanup(t *testing.T) {
 	}
 }
 
+// TestCLIInheritsDefaultUserCLIConfig proves that, with no TF_CLI_CONFIG_FILE
+// in the parent environment, a provider_installation/dev_overrides block in the
+// default ~/.tofurc reaches the OpenTofu child through the generated config.
+func TestCLIInheritsDefaultUserCLIConfig(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	home := t.TempDir()
+	homeConfig := `provider_installation {
+  dev_overrides {
+    "geektr-cloud/mgcl" = "/opt/mgcl-provider/bin"
+  }
+  direct {}
+}
+`
+	if err := os.WriteFile(filepath.Join(home, ".tofurc"), []byte(homeConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tmpDir := filepath.Join(dir, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "mgcl.db")
+	keyPath := writeTestIdentity(t)
+	capture := filepath.Join(dir, "captured.tfrc")
+
+	code, out := runMgclSync(t, bin, dir, baseEnvWithHome(home,
+		"TMPDIR="+tmpDir,
+		"CAPTURE_CONFIG="+capture,
+	), "run", "--host", "127.0.0.1:0", "--db", dbPath,
+		"--token", "secret-token", "--encryption-key-file", keyPath,
+		"--", "sh", "-c", `cp "$TF_CLI_CONFIG_FILE" "$CAPTURE_CONFIG"`)
+	if code != 0 {
+		t.Fatalf("mgcl run exit code = %d\n%s", code, out)
+	}
+
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, `"geektr-cloud/mgcl" = "/opt/mgcl-provider/bin"`) {
+		t.Fatalf("child CLI config lost default ~/.tofurc dev_overrides:\n%s", got)
+	}
+	if !strings.Contains(got, `host "127.0.0.1:`) || !strings.Contains(got, `"state.v2"`) {
+		t.Fatalf("child CLI config missing local host block:\n%s", got)
+	}
+	if !strings.Contains(got, `token = "secret-token"`) {
+		t.Fatalf("child CLI config missing run token:\n%s", got)
+	}
+}
+
 func TestCLIBadConfigFailsBeforeStartup(t *testing.T) {
 	requireCLI(t)
 

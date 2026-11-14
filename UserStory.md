@@ -169,12 +169,13 @@ provider "aws" {
 }
 ```
 
-provider 已实现但还没发布到 Registry；开发期需要 provider 仓库构建的二进制和 `dev_overrides`：
+provider 已实现但还没发布到 Registry；开发期需要 provider 仓库构建的二进制和 `dev_overrides`。把 `dev_overrides` 写进 OpenTofu 默认 CLI config `~/.tofurc`：
 
 ```hcl
-# dev.tfrc
+# ~/.tofurc
 provider_installation {
   dev_overrides {
+    # 必须是包含 terraform-provider-mgcl 二进制的目录，不是二进制文件本身
     "geektr-cloud/mgcl" = "/path/to/terraform-provider-mgcl/bin"
   }
   direct {}
@@ -182,13 +183,12 @@ provider_installation {
 ```
 
 ```bash
-export TF_CLI_CONFIG_FILE=/path/to/dev.tfrc
 mgcl run -- tofu validate
 mgcl run -- tofu plan
 mgcl run -- tofu apply -auto-approve
 ```
 
-`dev_overrides` 路径会跳过 `tofu init`；需要 init 时改用 filesystem mirror。`dev_overrides` 只能通过 `TF_CLI_CONFIG_FILE` 交给 tofu；`mgcl run` 会保留这份内容并追加本地服务的 host block。provider 需要 OpenTofu >=1.11。
+`mgcl run` 会自动继承 `~/.tofurc` 并追加本地服务的 host block；显式设置 `TF_CLI_CONFIG_FILE` 时读取该文件，优先于默认 `~/.tofurc`。`dev_overrides` 会跳过该 provider 的 `tofu init`，需要 init 时改用 filesystem mirror。provider 需要 OpenTofu >=1.11。
 
 只有 `mgcl run -- <command>` 会签发 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`；常驻 `mgcl run` 不签发 provider token。TACOS 用户 token 两种模式都会自动生成：子进程模式只写进本次临时 CLI config、不打印，常驻模式在启动后打印一次。Secret 每次 plan/apply 由 provider 重新读取，所以更新 Secret 后下一条命令能读到新值。
 

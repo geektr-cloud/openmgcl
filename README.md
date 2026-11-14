@@ -118,7 +118,7 @@ mgcl run --db ./mgcl.db -- \
   sh -c 'tofu init -input=false && tofu apply -auto-approve -input=false'
 ```
 
-`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程，命令结束后关闭服务。token 不需要配置：每次运行自动生成一个全新随机 token，只写进本次临时 CLI config，不打印。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。子进程退出码原样作为 `mgcl` 退出码；被信号终止时为 `128+signal`。
+`mgcl run` 会启动服务，把 `TF_CLOUD_HOSTNAME` 和临时 `TF_CLI_CONFIG_FILE` 注入子进程。临时配置会保留用户现有 CLI config：显式设置的 `TF_CLI_CONFIG_FILE` 优先，否则继承默认 `~/.tofurc`。命令结束后关闭服务。token 不需要配置：每次运行自动生成一个全新随机 token，只写进本次临时 CLI config，不打印。state 留在 `mgcl.db`，下次继续用同一个 `--db` 即可。子进程退出码原样作为 `mgcl` 退出码；被信号终止时为 `128+signal`。
 
 如果使用 `remote` backend，OpenTofu 要求显式 `hostname`：
 
@@ -187,12 +187,13 @@ MGCL_PROVIDER_TOKEN=<一次性随机 token>
 
 常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。它只能调用 `POST /api/mgcl/v1/secrets:read`，不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 Secret API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
 
-provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后用 `dev_overrides`：
+provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后把 `dev_overrides` 写进 OpenTofu 的默认 CLI config `~/.tofurc`：
 
 ```hcl
-# dev.tfrc
+# ~/.tofurc
 provider_installation {
   dev_overrides {
+    # 必须是包含 terraform-provider-mgcl 二进制的目录，不是二进制文件本身
     "geektr-cloud/mgcl" = "/path/to/terraform-provider-mgcl/bin"
   }
   direct {}
@@ -200,9 +201,13 @@ provider_installation {
 ```
 
 ```bash
-export TF_CLI_CONFIG_FILE=/path/to/dev.tfrc
+# 该目录下应直接放着 terraform-provider-mgcl
+ls /path/to/terraform-provider-mgcl/bin/terraform-provider-mgcl
+
 mgcl run --db ./mgcl.db -- tofu plan
 ```
+
+`mgcl run` 会自动继承 `~/.tofurc` 并追加本地服务的 host block。设置了 `TF_CLI_CONFIG_FILE` 时改为读取该文件，优先于默认 `~/.tofurc`。`dev_overrides` 会跳过该 provider 的 `tofu init` 安装/校验；需要真正的 `tofu init` 时改用 filesystem mirror。
 
 HCL 示例：
 

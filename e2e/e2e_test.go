@@ -175,15 +175,36 @@ func requireTofu(t *testing.T) {
 	}
 }
 
+// e2eHome is a temporary HOME shared by e2e subprocesses. Isolating HOME keeps
+// tests from reading the developer's real OpenTofu CLI config (~/.tofurc) or
+// writing credentials into their real home directory.
+var e2eHome string
+
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "mgcl-e2e-home-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create temporary HOME: %v\n", err)
+		os.Exit(1)
+	}
+	e2eHome = home
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
+}
+
 // baseEnv returns a clean environment that avoids leaking host settings.
 func baseEnv(extra ...string) []string {
+	return baseEnvWithHome(e2eHome, extra...)
+}
+
+// baseEnvWithHome is baseEnv with an explicit isolated HOME.
+func baseEnvWithHome(home string, extra ...string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		"HOME=" + home,
 		"CHECKPOINT_DISABLE=1",
 	}
-	env = append(env, extra...)
-	return env
+	return append(env, extra...)
 }
 
 // initTestGitRepo marks dir as a Git working tree. The git_utils package only

@@ -27,6 +27,10 @@ workspace 的命名空间。任意字符串即隐式存在，无创建、无成�
 organization 下的具名状态容器。本项目一律为 local 执行模式，仅承载 state，不承载远程运行。
 _Avoid_: project, environment
 
+**State reference**:
+`<organization>/<workspace>` 形式的寻址字符串，供 `mgcl state` 命令定位 workspace。恰好包含一个 `/`，按第一个 `/` 拆分；两段都不能为空，也不能再含 `/`。
+_Avoid_: workspace ID, state path
+
 **State version**:
 workspace 内一份 state 快照记录，携带 serial、lineage 与状态字节，生命周期为 pending 或 finalized。
 _Avoid_: state file, snapshot
@@ -69,6 +73,18 @@ state version 的两个生命周期状态：已创建但状态字节未到（pen
 用不同内容的 state 创建 replacement，使 current 回到该内容。restore 可由普通更新或 force push 触发；服务端按请求内容与冲突规则判断。
 _Avoid_: rollback, force push（force push 是客户端选项）
 
+**State prune**:
+删除 workspace 中最近 n 个 finalized 版本之外的历史版本；pending 与 current 不受影响。prune 不 VACUUM、不清理 Lineage Key，数据库文件不保证缩小。
+_Avoid_: garbage collection, cleanup（含义过宽）
+
+**State export**:
+把 current finalized 版本的 JSON state（`--outputs` 时为 JSON state outputs）解密写出。没有 raw state 回退；输出可能包含敏感明文。
+_Avoid_: state dump, backup（备份指整库副本）
+
+**State delete / State unlock**:
+State delete 删除一个 workspace 及其全部 finalized 与 pending 版本；State unlock 离线强制清除 workspace lock。两者都用完整 State reference 确认，都不清理 Lineage Key；prune/delete 遇到 locked 时拒绝，须先停止写进程再 unlock。
+_Avoid_: destroy, rollback
+
 **Foreign upload / download**:
 客户端对服务端签发的上传/下载 URL 发起的原始字节请求（`application/octet-stream`），不携带 Bearer 凭据。
 
@@ -80,11 +96,19 @@ _Avoid_: overwrite, force unlock（后者是锁操作）
 workspace 级互斥锁，防止并发写 state；有 lock / unlock / force-unlock 三个操作。
 
 **Secret**:
-首次运行 OpenTofu 前需要准备的一组 bootstrap 凭据（例如 IAM access key、跨云凭据），以具名 KV 集合保存。它只覆盖 mgcl 接管的 bootstrap credentials，不接管 OpenTofu 创建的 state outputs。
+首次运行 OpenTofu 前需要准备的一组 bootstrap 凭据（例如 IAM access key、跨云凭据），以具名 KV 集合保存。访问可见性属于每个 KV，不属于 Secret 整体；Secret 本身只是 KV 的容器。它只覆盖 mgcl 接管的 bootstrap credentials，不接管 OpenTofu 创建的 state outputs。
 _Avoid_: state output, managed resource
 
+**Ephemeral KV**:
+默认访问标记（`is_ephemeral = 1`）的 KV。完整读取（`access` 为空或 `ephemeral`）会返回它；`access: "public"` 不返回它。新建 KV 默认使用该标记。
+_Avoid_: private secret（易与静态加密混淆）
+
+**Public KV**:
+通过 `mgcl secret set --public` 或 provider 写 API 把单个 KV 置为 `is_ephemeral = 0` 的访问标记。public 读取只返回这类 KV；同一 Secret 的其他 KV 不受影响。public 只描述访问类别，不表示数据库明文：KV 仍用 AES-256-GCM 加密，仍需要私钥。
+_Avoid_: plaintext secret, unencrypted secret
+
 **KV**:
-Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。
+Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。每个 KV 独立携带 `is_ephemeral` 访问标记。
 _Avoid_: secret version, key-value file
 
 **Secret DEK**:
@@ -96,7 +120,7 @@ _Avoid_: Lineage Key, state key
 _Avoid_: provider token, MGCL_TOKEN（环境变量名，不是概念）
 
 **Provider session**:
-`mgcl run` 为每次子进程启动签发的短期、只读凭证，只能读取当前数据库里的 Secret，不能读写 TACOS state 或执行管理操作。它不同于用户 Bearer token 和 SSH passphrase。
+`mgcl run` 为每次子进程启动签发的短期凭证，只能读写 Secret KV，不能读写 TACOS state 或执行管理操作。它不同于用户 Bearer token 和 SSH passphrase。
 _Avoid_: MGCL_TOKEN, user token
 
 **Backup destination**:
@@ -104,5 +128,5 @@ _Avoid_: MGCL_TOKEN, user token
 _Avoid_: backup target, snapshot, dump
 
 **Write session**:
-打开 `mgcl.db` 并可能提交写入的进程生命周期，例如 `mgcl run` 服务和 `mgcl secret create/set/unset/delete`。每个写会话必须复用同一备份层；只读命令不是写会话。
+打开 `mgcl.db` 并可能提交写入的进程生命周期，例如 `mgcl run` 服务、`mgcl secret create/set/unset/delete` 与 `mgcl state prune/delete/unlock`。每个写会话必须复用同一备份层；只读命令不是写会话。
 _Avoid_: backup job, sync process

@@ -8,7 +8,7 @@ OpenMgCl 是一个给 [OpenTofu](https://opentofu.org/) 用的本地 TACOS 状�
 
 ## 状态
 
-已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。state、JSON state 和 outputs 在 SQLite 中强制加密；bootstrap Secret 也保存在同一个加密数据库中，并通过 `mgcl run --` 签发的短期只读 provider session 提供给独立的 ephemeral provider。e2e 覆盖 remote backend、cloud block、lock 冲突、`mgcl run --`、错误私钥被拒绝和 provider token 生命周期。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
+已经可以跑真实 OpenTofu 的 init / plan / apply / destroy / state / lock 流程。state、JSON state 和 outputs 在 SQLite 中强制加密；bootstrap Secret 也保存在同一个加密数据库中，并通过 `mgcl run --` 签发的短期、限定路径 provider session 提供给独立的 provider。e2e 覆盖 remote backend、cloud block、lock 冲突、`mgcl run --`、错误私钥被拒绝和 provider token 生命周期。它只实现 TACOS 的状态存储子集，不是 Terraform Cloud 的替代品。
 
 目标场景是从零启动整套基础设施时的本地手动、交互式 OpenTofu 使用，不以 CI 或无人值守运行为目标。
 
@@ -52,6 +52,8 @@ mgcl run --db ./mgcl.db --encryption-key-file ~/.ssh/mgcl_ed25519 -- ...
 
 OpenTofu 第一次 apply 之前需要的凭据（例如 IAM access key）可以存进同一个 `mgcl.db`。Secret 是具名 KV 集合；每个 Secret 有独立的 32-byte DEK，DEK 再由当前 SSH Ed25519 Recipient 包裹。KV value 用 AES-256-GCM 单独加密，SQLite 里只有密文和明文元数据。
 
+每个 KV 独立带上 `is_ephemeral` 访问标记。新建 KV 默认 ephemeral（`is_ephemeral = 1`），会出现在每次 `mgcl_secret` 读取中；若某个凭据要交给 public provider function 使用（function 返回值可能进入 plan/state 或日志），用 `set <ref> --public` 只把该 KV 置为 public（`is_ephemeral = 0`）；public function 以 `access: "public"` 读取时只拿到这些 KV，同一 Secret 的其他 KV 不受影响。**public 不表示数据库明文**：KV 仍是 AES-256-GCM 密文，仍需要私钥。`list` 只显示 Secret 级元数据，`show` 逐 KV 显示访问标记。
+
 ```bash
 # 先创建空 Secret
 mgcl secret create bootstrap --db ./mgcl.db
@@ -62,6 +64,9 @@ printf '%s' "$AWS_ACCESS_KEY_ID" | \
 
 mgcl secret set bootstrap/secret_access_key --db ./mgcl.db
 # 没有位置 value 且 stdin 是 TTY 时，会从 TTY 无回显读取一次
+
+# 需要 public provider function 时，只把这一个 KV 标为 public
+mgcl secret set bootstrap/access_key_id --public --db ./mgcl.db
 
 mgcl secret list --db ./mgcl.db
 mgcl secret show bootstrap --db ./mgcl.db -o json
@@ -74,6 +79,9 @@ mgcl secret delete bootstrap --yes --db ./mgcl.db
 
 - Secret 名和 KV key 都匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，引用为 `<secret-name>/<key>`；
 - value 必须是 UTF-8，单值最多 64 KiB，每个 Secret 最多 64 个 KV、合计最多 256 KiB；
+- 新建 KV 默认 `is_ephemeral = 1`；`set --public` 只把该 KV 转为 `0`，普通 `set` 保留已有 KV 的标记；CLI 没有反向 flag，但 provider 写 API 可以把标记改回 `true`；`create` 不接受 `--public`；
+- provider 读取 `access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV；没有 public KV 时返回空 map，不报 Secret 级 403；非 public KV 不会被选择或解密；
+- provider session 还能调用 `secret-kvs:write` / `secret-kvs:delete`，供 managed resource 原子创建或删除 KV；delete 幂等且保留空 Secret，不自动创建 Secret；
 - 只保留最新值，没有历史版本；`set` 覆盖，`unset`/`delete` 不做安全擦除；
 - `list`、`show` 只读明文元数据，不加载私钥，也不会创建缺失的数据库；
 - `create` 可以在缺失路径初始化数据库；`set`、`get`、`unset`、`delete` 不隐式建库；
@@ -82,6 +90,8 @@ mgcl secret delete bootstrap --yes --db ./mgcl.db
 - 私钥丢失后对应 Secret 也无法恢复。`mgcl.db` 与私钥必须一起备份。
 
 `get` 把原始 UTF-8 字节写到 stdout，不追加换行；诊断和成功提示写 stderr。任何错误、日志或提示都不会打印 value、DEK、wrapped key、nonce 或 provider token。
+
+本版本不自动迁移旧数据库，也不做 schema 版本管理。v0.1.0 创建的 `mgcl.db` 需先用外部一次性程序加字段：在 `/tmp/mgcl-migrate` 目录中构建后运行 `/tmp/mgcl-migrate/mgcl-migrate ./path/to/my.db`（或进入该目录运行 `./mgcl-migrate ./path/to/my.db`），再交给本版本使用。
 
 完整语义见 [docs/secret-management.md](docs/secret-management.md)。
 
@@ -185,7 +195,7 @@ MGCL_PROVIDER_ENDPOINT=http://127.0.0.1:<实际端口>
 MGCL_PROVIDER_TOKEN=<一次性随机 token>
 ```
 
-常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。它只能调用 `POST /api/mgcl/v1/secrets:read`，不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 Secret API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
+常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。撤销只影响后续请求：已经通过认证并开始的写/删可能继续完成；读取会在返回明文前再次校验 token。它只能调用 `POST /api/mgcl/v1/secrets:read`、`secret-kvs:write` 和 `secret-kvs:delete`；读取请求体用 `access: "ephemeral"` 或 `"public"` 选择范围，空 access 按 ephemeral 兼容旧 provider，`ephemeral` 返回全部 KV，`public` 只返回 public KV；不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 provider API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
 
 provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后把 `dev_overrides` 写进 OpenTofu 的默认 CLI config `~/.tofurc`：
 
@@ -265,7 +275,7 @@ backup_to:
 
 ### 数据库备份
 
-`--backup-to` 可重复，用于在 `mgcl run` 或 `mgcl secret create/set/unset/delete` 期间把同一个 `mgcl.db` 覆盖复制到显式配置的位置。YAML 使用 `backup_to` 字符串数组；只要出现 `--backup-to`，整份列表就替换 YAML，不做合并。不读取 `MGCL_BACKUP_TO`。`--backup-to` 的相对路径按当前工作目录解析，YAML 的相对路径按 Git 根目录解析。`mgcl secret list/show/get` 不触发备份。
+`--backup-to` 可重复，用于在 `mgcl run`、`mgcl secret` 写命令和 `mgcl state` 写命令期间把同一个 `mgcl.db` 覆盖复制到显式配置的位置。YAML 使用 `backup_to` 字符串数组；只要出现 `--backup-to`，整份列表就替换 YAML，不做合并。不读取 `MGCL_BACKUP_TO`。`--backup-to` 的相对路径按当前工作目录解析，YAML 的相对路径按 Git 根目录解析。`mgcl secret list/show/get` 与 `mgcl state list/stats/info/export` 不触发备份。
 
 ```bash
 mgcl run --db ./mgcl.db \
@@ -285,6 +295,31 @@ mgcl run --db ./mgcl.db \
 
 备份内容沿用数据库现有加密格式，仍需和私钥一起保存。完整语义、校验规则与退出码见 [docs/database-backup.md](docs/database-backup.md)，决策见 [ADR-0007](docs/adr/0007-sqlite-backup-destinations.md)。
 
+## State 管理
+
+`mgcl state` 离线管理同一个 `mgcl.db` 中的 workspace 与 state 版本，不需要启动服务或配置 token。workspace 用 `<organization>/<workspace>` 引用；配置继承 `mgcl run` 与 `<git-root>/.mgcl.yaml`。
+
+| 命令 | 作用 |
+|---|---|
+| `mgcl state list` | 列出所有 workspace（含空 workspace）及 finalized / pending 计数 |
+| `mgcl state stats` | 按 workspace 汇总加密 state 体积 |
+| `mgcl state info <ref>` | 按创建顺序倒序列出全部版本，标出 current |
+| `mgcl state export <ref> [--outputs] [-f <path>]` | 导出 current finalized 的 JSON state 或 outputs |
+| `mgcl state prune <ref> --keeps <n>` | 只保留最近 n 个 finalized 版本 |
+| `mgcl state delete <ref>` | 删除 workspace 及其全部版本 |
+| `mgcl state unlock <ref>` | 离线强制解锁 |
+
+```bash
+mgcl state list --db ./mgcl.db
+mgcl state info local/demo --db ./mgcl.db
+mgcl state export local/demo -f demo.tfstate.json --db ./mgcl.db
+mgcl state prune local/demo --keeps 5 --db ./mgcl.db
+```
+
+`list`、`stats`、`info`、`export` 是只读命令，不创建、迁移或备份数据库；`export` 需要私钥，输出可能含敏感明文。`prune`、`delete` 与需要清除 lock 的 `unlock` 是写会话，复用 `--backup-to` / `backup_to` 备份层。`prune` 和 `delete` 遇到 lock 会拒绝，需先停止所有写进程再 `unlock`；两者要求输入完整 State reference 确认，非交互时用 `--yes-i-know-this-will-permanently-delete-this-state`。`unlock` 锁定时没有非交互绕过。
+
+`stats` 的 `SIZE` 是三个加密 blob 列（`state`、`json_state`、`json_state_outputs`）的长度和，不含 SQLite 页、索引、空闲空间或 WAL，不等于数据库文件大小。`prune`/`delete` 不 `VACUUM`，文件不保证缩小，也不清理 lineage keys。完整语义见 [docs/state-management.md](docs/state-management.md)。
+
 ## 已实现的 API
 
 TACOS `state.v2` 子集与 provider Secret API：
@@ -294,6 +329,7 @@ TACOS `state.v2` 子集与 provider Secret API：
 - `GET /api/v2/organizations/{org}/entitlement-set`
 - `GET|POST /api/v2/organizations/{org}/workspaces`
 - `GET /api/v2/organizations/{org}/workspaces/{name}`
+- `PATCH /api/v2/workspaces/{id}`（仅更新 `terraform-version`）
 - `POST /api/v2/workspaces/{id}/actions/lock|unlock|force-unlock`
 - `POST /api/v2/workspaces/{id}/state-versions`
 - `GET /api/v2/workspaces/{id}/current-state-version`
@@ -301,15 +337,17 @@ TACOS `state.v2` 子集与 provider Secret API：
 - `PUT /api/v2/state-versions/{id}/state-upload`（免认证）
 - `PUT /api/v2/state-versions/{id}/json-state-upload`（免认证）
 - `GET /api/v2/state-versions/{id}/download`（免认证）
-- `POST /api/mgcl/v1/secrets:read`（provider session token；`Cache-Control: no-store`）
+- `POST /api/mgcl/v1/secrets:read`（provider session token；`access: ephemeral|public`；`Cache-Control: no-store`）
+- `POST /api/mgcl/v1/secret-kvs:write`（provider session token；创建或覆盖 KV；`Cache-Control: no-store`）
+- `POST /api/mgcl/v1/secret-kvs:delete`（provider session token；幂等删除 KV；`Cache-Control: no-store`）
 
-TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Authorization: Bearer <token>`；空 token 不表示免认证。子进程 `mgcl run --` 自动把当次 token 写入临时 CLI config，常驻 run 自动生成并打印一次，显式 `--token`/`MGCL_TOKEN`/YAML token 保持固定值。provider session token 只接受于 `secrets:read`，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 `secrets:read`。没有活跃 provider session 时该端点一律 401。
+TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Authorization: Bearer <token>`；空 token 不表示免认证。子进程 `mgcl run --` 自动把当次 token 写入临时 CLI config，常驻 run 自动生成并打印一次，显式 `--token`/`MGCL_TOKEN`/YAML token 保持固定值。provider session token 只接受于上述三个 provider 路径，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 provider 路径。没有活跃 provider session 时这些端点一律 401。
 
 ## 限制
 
 - 只做 state 存储；没有 runs、variables、policies、teams、VCS 等 TFC 功能。
 - workspace 固定 local 执行模式，entitlement-set 返回 `operations: false`。
-- workspace 只支持创建、列表、按 name 查询和加锁；没有 update/delete。
+- workspace 只支持创建、列表、按 name 查询、加锁和更新 `terraform-version`；TACOS API 没有 workspace delete，离线删除用 `mgcl state delete`。
 - discovery 同时通告 `state.v2`、`tfe.v2`、`tfe.v2.1`，原因见 [ADR-0001](docs/adr/0001-advertise-service-ids-beyond-implemented-scope.md)。未实现的端点会返回 404。
 - SQLite 单连接，面向本地单用户；不要拿它做多租户服务。
 - 上传/下载 URL 按设计免认证，靠随机 ID 保护；不要暴露到不可信网络。
@@ -322,7 +360,8 @@ TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Auth
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
 - 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。
-- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期只读凭证，不是 TACOS 用户 token，也不能管理 Secret。
+- Secret 的访问标记属于每个 KV：新建 KV 默认 ephemeral；`set --public` 只把目标 KV 转为 public，普通 `set` 保留已有标记。public 只改变该 KV 的访问类别，不改变静态加密，也不意味着数据库中是明文。`access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV，没有匹配时返回空 map。
+- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期、限定路径的凭证，可读 Secret KV 并供 managed resource 调用 write/delete，不是 TACOS 用户 token，也不能执行其他 Secret 管理操作。
 - Secret 写入与 `mgcl run` 共用同一个 `mgcl.db` 和备份层；同一数据库不应同时运行多个写会话。备份不含明文 value，恢复仍只依赖 `mgcl.db` 和私钥。
 - 非 loopback provider endpoint 或 serverURL 需要显式确认。provider endpoint 是 HTTP；`--server` 的加密取决于其 scheme。
 - 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。

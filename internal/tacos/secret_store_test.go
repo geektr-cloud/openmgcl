@@ -2,6 +2,7 @@ package tacos
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -23,6 +24,94 @@ func openTestSecretStore(t *testing.T, path string, identity *Identity) *SecretS
 		}
 	})
 	return store
+}
+
+func createLegacySecretDB(t *testing.T, path string, secretLevelColumn bool) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	secretColumns := `id TEXT PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL`
+	if secretLevelColumn {
+		secretColumns = `id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			is_ephemeral INTEGER NOT NULL DEFAULT 1 CHECK (is_ephemeral IN (0, 1)),
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL`
+	}
+	if _, err := db.Exec(`CREATE TABLE secrets (` + secretColumns + `)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`CREATE TABLE secret_kvs (
+			secret_id TEXT NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			suite INTEGER NOT NULL,
+			nonce BLOB NOT NULL,
+			ciphertext BLOB NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (secret_id, key)
+		)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO secrets (id, name, created_at, updated_at) VALUES ('legacy-id', 'legacy', 'now', 'now')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSecretSchemaOutdated(t *testing.T) {
+	for _, secretLevelColumn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("secret-level-column=%t", secretLevelColumn), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "mgcl.db")
+			identity := testIdentity(t)
+			createLegacySecretDB(t, path, secretLevelColumn)
+
+			if _, err := OpenSecretStore(path, identity, nil); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("Open error = %v, want ErrSecretSchemaOutdated", err)
+			} else if !strings.Contains(err.Error(), "secret_kvs.is_ephemeral") || !strings.Contains(err.Error(), "mgcl-migrate") {
+				t.Fatalf("Open error lacks schema detail: %v", err)
+			}
+
+			store, err := OpenSecretStoreReadOnly(path, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			if _, err := store.ListSecrets(); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("ListSecrets error = %v", err)
+			}
+			if _, err := store.ShowSecret("legacy"); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("ShowSecret error = %v", err)
+			}
+			if _, err := store.GetSecretValue("legacy", "key"); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("GetSecretValue error = %v", err)
+			}
+			if _, err := store.ReadSecretValues("legacy"); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("ReadSecretValues error = %v", err)
+			}
+
+			// Provider reads use Store.readSecretValues and must fail the same way.
+			db, err := openSecretDB(path, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			providerStore := &Store{db: db, identity: identity}
+			defer providerStore.Close()
+			if _, _, err := providerStore.ReadSecretValuesContextAccess(context.Background(), "legacy", true); !errors.Is(err, ErrSecretSchemaOutdated) {
+				t.Fatalf("provider read error = %v", err)
+			}
+		})
+	}
 }
 
 func TestSecretCreateListShow(t *testing.T) {
@@ -54,7 +143,7 @@ func TestSecretCreateListShow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(details.Keys) != 1 || details.Keys[0].Key != "access_key_id" {
+	if len(details.Keys) != 1 || details.Keys[0].Key != "access_key_id" || !details.Keys[0].IsEphemeral {
 		t.Fatalf("details = %+v", details)
 	}
 	if _, err := store.ShowSecret("missing"); !errors.Is(err, ErrSecretNotFound) {
@@ -64,6 +153,155 @@ func TestSecretCreateListShow(t *testing.T) {
 		if _, err := store.CreateSecret(name); err == nil {
 			t.Errorf("invalid name %q was accepted", name)
 		}
+	}
+}
+
+func TestSecretKVSchemaIsEphemeralDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mgcl.db")
+	store := openTestSecretStore(t, path, testIdentity(t))
+
+	var secretsColumn int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name = 'is_ephemeral'`,
+	).Scan(&secretsColumn); err != nil {
+		t.Fatal(err)
+	}
+	if secretsColumn != 0 {
+		t.Fatal("secrets still has an is_ephemeral column")
+	}
+
+	var defaultValue string
+	if err := store.db.QueryRow(
+		`SELECT dflt_value FROM pragma_table_info('secret_kvs') WHERE name = 'is_ephemeral'`,
+	).Scan(&defaultValue); err != nil {
+		t.Fatal(err)
+	}
+	if defaultValue != "1" {
+		t.Fatalf("secret_kvs.is_ephemeral default = %q, want 1", defaultValue)
+	}
+
+	if _, err := store.db.Exec(
+		`INSERT INTO secrets (id, name, created_at, updated_at) VALUES ('schema-check', 'schema-check', 'now', 'now')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO secret_kvs (secret_id, key, suite, nonce, ciphertext, is_ephemeral, created_at, updated_at)
+		VALUES ('schema-check', 'bad', 1, x'000000000000000000000000', x'00000000000000000000000000000000', 2, 'now', 'now')`,
+	); err == nil {
+		t.Fatal("secret_kvs.is_ephemeral CHECK accepted 2")
+	}
+
+	if _, err := store.CreateSecret("defaulted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSecretValue("defaulted", "key", []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	var isEphemeral int
+	if err := store.db.QueryRow(
+		`SELECT is_ephemeral FROM secret_kvs WHERE key = 'key'`,
+	).Scan(&isEphemeral); err != nil {
+		t.Fatal(err)
+	}
+	if isEphemeral != 1 {
+		t.Fatalf("new KV is_ephemeral = %d, want 1", isEphemeral)
+	}
+}
+
+func TestSecretSetPublicVisibility(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mgcl.db")
+	store := openTestSecretStore(t, path, testIdentity(t))
+	created, err := store.CreateSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := store.SetSecretValueWithPublic("bootstrap", "public", []byte("first"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	details, err := store.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(details.Keys) != 1 || details.Keys[0].Key != "public" || details.Keys[0].IsEphemeral {
+		t.Fatalf("details = %+v", details)
+	}
+	if details.UpdatedAt == created.UpdatedAt {
+		t.Fatal("SetSecretValueWithPublic did not update updated_at")
+	}
+	list, err := store.ListSecrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].KeyCount != 1 {
+		t.Fatalf("list = %+v", list)
+	}
+
+	// A plain set of the same KV keeps the public mark.
+	if err := store.SetSecretValue("bootstrap", "public", []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Keys[0].IsEphemeral {
+		t.Fatal("plain SetSecretValue reset the KV to ephemeral")
+	}
+	got, err := store.GetSecretValue("bootstrap", "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "second" {
+		t.Fatalf("value after plain set = %q", got)
+	}
+
+	// New KVs stay ephemeral and do not change the existing public KV.
+	if err := store.SetSecretValue("bootstrap", "private", []byte("private")); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks := map[string]bool{}
+	for _, key := range details.Keys {
+		marks[key.Key] = key.IsEphemeral
+	}
+	if marks["public"] {
+		t.Fatal("new plain set reset the public KV")
+	}
+	if !marks["private"] {
+		t.Fatal("new KV did not default to ephemeral")
+	}
+
+	// Unset leaves the remaining KV mark unchanged.
+	if err := store.UnsetSecretValue("bootstrap", "private"); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(details.Keys) != 1 || details.Keys[0].IsEphemeral {
+		t.Fatalf("unset reset the KV mark: %+v", details.Keys)
+	}
+
+	// Deleting another Secret does not change the public KV.
+	if _, err := store.CreateSecret("neighbor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteSecret("neighbor", nil); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if details.Keys[0].IsEphemeral {
+		t.Fatal("DeleteSecret reset another Secret's KV mark")
 	}
 }
 
@@ -219,6 +457,9 @@ func TestSecretWrongRecipient(t *testing.T) {
 	if err := otherStore.SetSecretValue("bootstrap", "key", []byte("changed")); !errors.Is(err, ErrSecretRecipientMismatch) {
 		t.Fatalf("set error = %v", err)
 	}
+	if err := otherStore.SetSecretValueWithPublic("bootstrap", "key", []byte("changed"), true); !errors.Is(err, ErrSecretRecipientMismatch) {
+		t.Fatalf("set public error = %v", err)
+	}
 	if err := otherStore.UnsetSecretValue("bootstrap", "key"); !errors.Is(err, ErrSecretRecipientMismatch) {
 		t.Fatalf("unset error = %v", err)
 	}
@@ -241,12 +482,20 @@ func TestSecretWrongRecipient(t *testing.T) {
 		t.Fatalf("fresh value = %q", got)
 	}
 
-	// Owner's original value was not modified by the failed writes.
+	// Owner's original value was not modified and the failed public write did
+	// not change the KV mark.
 	ownerStore, err := OpenSecretStoreReadOnly(path, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ownerStore.Close()
+	details, err := ownerStore.ShowSecret("bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(details.Keys) != 1 || !details.Keys[0].IsEphemeral {
+		t.Fatal("failed public write changed the KV mark")
+	}
 	got, err = ownerStore.GetSecretValue("bootstrap", "key")
 	if err != nil {
 		t.Fatal(err)

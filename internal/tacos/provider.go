@@ -12,75 +12,51 @@ import (
 )
 
 const (
-	maxProviderRequestBody  = 8 << 10
-	providerBodyReadTimeout = 10 * time.Second
+	maxProviderReadRequestBody  = 8 << 10
+	maxProviderWriteRequestBody = 512 << 10
+	providerBodyReadTimeout     = 10 * time.Second
 )
 
-// secretsReadHandler implements the only provider API endpoint. It never lists
-// secrets, never mutates them, and never logs request/response bodies, tokens or
-// values.
+// secretsReadHandler reads KVs. access "ephemeral" (or empty) returns every KV
+// with its mark; access "public" returns only public KVs. It never lists
+// Secrets, never logs request/response bodies, tokens or values.
 func (s *Server) secretsReadHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		writeProviderError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	token, ok := s.authorizeProvider(r)
+	token, cleanup, ok := s.beginProviderRequest(w, r)
 	if !ok {
-		writeProviderError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
-	controller := http.NewResponseController(w)
-	deadlineErr := controller.SetReadDeadline(time.Now().Add(providerBodyReadTimeout))
-	if deadlineErr != nil && !errors.Is(deadlineErr, http.ErrNotSupported) {
-		writeProviderError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if deadlineErr == nil {
-		defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, maxProviderRequestBody)
-	decoder := json.NewDecoder(r.Body)
+	defer cleanup()
 	var req providerapi.ReadSecretRequest
-	if err := decoder.Decode(&req); err != nil {
-		if isBodyTooLarge(err) {
-			writeProviderError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		writeProviderError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if isBodyTooLarge(err) {
-			writeProviderError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		writeProviderError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeProviderJSON(w, r, maxProviderReadRequestBody, &req) {
 		return
 	}
 	if !ValidSecretName(req.Name) {
 		writeProviderError(w, http.StatusBadRequest, "invalid secret name")
 		return
 	}
+	allKeys, ok := providerAccess(req.Access)
+	if !ok {
+		writeProviderError(w, http.StatusBadRequest, "invalid access")
+		return
+	}
 
-	values, err := s.store.ReadSecretValuesContext(r.Context(), req.Name)
+	values, marks, err := s.store.ReadSecretValuesContextAccess(r.Context(), req.Name, allKeys)
 	if err != nil {
-		if errors.Is(err, ErrSecretNotFound) {
+		switch {
+		case errors.Is(err, ErrSecretNotFound):
 			writeProviderError(w, http.StatusNotFound, "secret not found")
-			return
+		case errors.Is(err, ErrSecretRecipientMismatch):
+			writeProviderError(w, http.StatusForbidden, "secret key access denied")
+		default:
+			writeProviderError(w, http.StatusInternalServerError, "internal error")
 		}
-		writeProviderError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if values == nil {
 		values = map[string]string{}
+	}
+	if marks == nil {
+		marks = map[string]bool{}
 	}
 
 	// Re-check the same token after successful decryption and immediately
@@ -97,9 +73,147 @@ func (s *Server) secretsReadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(providerapi.ReadSecretResponse{
-		Name:   req.Name,
-		Values: values,
+		Name:           req.Name,
+		Values:         values,
+		EphemeralMarks: marks,
 	})
+}
+
+// secretKVsWriteHandler creates or overwrites one KV. A missing Secret is
+// created atomically with its DEK; existing KVs update value and mark.
+func (s *Server) secretKVsWriteHandler(w http.ResponseWriter, r *http.Request) {
+	_, cleanup, ok := s.beginProviderRequest(w, r)
+	if !ok {
+		return
+	}
+	defer cleanup()
+	var req providerapi.WriteSecretKVRequest
+	if !decodeProviderJSON(w, r, maxProviderWriteRequestBody, &req) {
+		return
+	}
+	if _, _, err := ParseSecretReference(req.Key); err != nil {
+		writeProviderError(w, http.StatusBadRequest, "invalid secret reference")
+		return
+	}
+	// A missing is_ephemeral field means ephemeral, never public.
+	isEphemeral := true
+	if req.IsEphemeral != nil {
+		isEphemeral = *req.IsEphemeral
+	}
+	name, key, err := s.store.WriteSecretKVContext(r.Context(), req.Key, []byte(req.Value), isEphemeral)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSecretInvalidValue):
+			writeProviderError(w, http.StatusBadRequest, "invalid secret value")
+		case errors.Is(err, ErrSecretLimitExceeded):
+			writeProviderError(w, http.StatusBadRequest, "secret limit exceeded")
+		case errors.Is(err, ErrSecretRecipientMismatch):
+			writeProviderError(w, http.StatusForbidden, "secret key access denied")
+		default:
+			writeProviderError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(providerapi.WriteSecretKVResponse{
+		Name:        name,
+		Key:         key,
+		IsEphemeral: isEphemeral,
+	})
+}
+
+// secretKVsDeleteHandler deletes one KV. Missing Secrets and KVs are
+// idempotent successes and never create a Secret.
+func (s *Server) secretKVsDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	_, cleanup, ok := s.beginProviderRequest(w, r)
+	if !ok {
+		return
+	}
+	defer cleanup()
+	var req providerapi.DeleteSecretKVRequest
+	if !decodeProviderJSON(w, r, maxProviderReadRequestBody, &req) {
+		return
+	}
+	if _, _, err := ParseSecretReference(req.Key); err != nil {
+		writeProviderError(w, http.StatusBadRequest, "invalid secret reference")
+		return
+	}
+	name, key, err := s.store.DeleteSecretKVContext(r.Context(), req.Key)
+	if err != nil {
+		writeProviderError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(providerapi.DeleteSecretKVResponse{Name: name, Key: key})
+}
+
+// beginProviderRequest applies the shared provider API guards: no-store
+// headers, POST-only, provider-session authorization and a bounded read
+// deadline. The returned cleanup resets the deadline.
+func (s *Server) beginProviderRequest(w http.ResponseWriter, r *http.Request) (string, func(), bool) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeProviderError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return "", func() {}, false
+	}
+	token, ok := s.authorizeProvider(r)
+	if !ok {
+		writeProviderError(w, http.StatusUnauthorized, "unauthorized")
+		return "", func() {}, false
+	}
+
+	controller := http.NewResponseController(w)
+	deadlineErr := controller.SetReadDeadline(time.Now().Add(providerBodyReadTimeout))
+	if deadlineErr != nil && !errors.Is(deadlineErr, http.ErrNotSupported) {
+		writeProviderError(w, http.StatusInternalServerError, "internal error")
+		return "", func() {}, false
+	}
+	if deadlineErr != nil {
+		return token, func() {}, true
+	}
+	return token, func() { _ = controller.SetReadDeadline(time.Time{}) }, true
+}
+
+func decodeProviderJSON(w http.ResponseWriter, r *http.Request, maxBody int64, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		if isBodyTooLarge(err) {
+			writeProviderError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeProviderError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if isBodyTooLarge(err) {
+			writeProviderError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return false
+		}
+		writeProviderError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
+
+// providerAccess maps the wire access value to a read mode. Empty access
+// preserves the v0.1.0 behavior and means ephemeral (all KVs).
+func providerAccess(access string) (allKeys bool, ok bool) {
+	switch access {
+	case "", providerapi.SecretAccessEphemeral:
+		return true, true
+	case providerapi.SecretAccessPublic:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func (s *Server) authorizeProvider(r *http.Request) (string, bool) {
@@ -120,7 +234,7 @@ func (s *Server) rejectProviderTokenMiddleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == providerapi.SecretsReadPath {
+		if isProviderPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -130,6 +244,15 @@ func (s *Server) rejectProviderTokenMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isProviderPath(path string) bool {
+	switch path {
+	case providerapi.SecretsReadPath, providerapi.SecretKVsWritePath, providerapi.SecretKVsDeletePath:
+		return true
+	default:
+		return false
+	}
 }
 
 func bearerToken(r *http.Request) (string, bool) {

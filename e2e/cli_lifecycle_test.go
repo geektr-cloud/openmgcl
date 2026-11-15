@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 // requireCLI skips CLI lifecycle tests in short mode. These tests use the
@@ -361,6 +364,57 @@ func TestCLIMissingDBFailsBeforeStartup(t *testing.T) {
 	}
 	if strings.Contains(out, "MgCl server listening on") {
 		t.Fatalf("server started without a database path:\n%s", out)
+	}
+}
+
+func TestCLILegacySecretSchemaFailsBeforeListening(t *testing.T) {
+	requireCLI(t)
+
+	bin := buildMgcl(t)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "mgcl.db")
+	keyPath := writeTestIdentity(t)
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`CREATE TABLE secrets (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO secrets (id, name, created_at, updated_at) VALUES ('legacy-id', 'legacy', 'now', 'now')`,
+	); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := runMgclSync(t, bin, dir, baseEnv(),
+		"run", "--host", "127.0.0.1:0", "--db", dbPath,
+		"--encryption-key-file", keyPath,
+		"--", "sh", "-c", "true")
+
+	if code == 0 {
+		t.Fatalf("mgcl run accepted an outdated secret schema:\n%s", out)
+	}
+	if strings.Contains(out, "MgCl server listening on") {
+		t.Fatalf("server started despite an outdated secret schema:\n%s", out)
+	}
+	for _, want := range []string{"secret_kvs.is_ephemeral", "mgcl-migrate"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("startup error lacks %q:\n%s", want, out)
+		}
 	}
 }
 

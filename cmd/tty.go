@@ -10,6 +10,17 @@ import (
 	"golang.org/x/term"
 )
 
+// confirmTerminalExact asks for the exact confirmation phrase (normally the
+// full state reference). Anything else, including y/yes, cancels.
+func confirmTerminalExact(stderr io.Writer, prompt, expected string) (bool, error) {
+	fmt.Fprintf(stderr, "%s Type %q to confirm: ", prompt, expected)
+	answer, err := readTerminalLine()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(answer) == expected, nil
+}
+
 // Test hooks keep terminal-only branches testable without a real PTY.
 var (
 	stdinIsTerminal = func() bool {

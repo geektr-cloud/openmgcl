@@ -55,6 +55,8 @@ func buildRouter(s *Server) http.Handler {
 	// Provider Secret API. It is deliberately outside /api/v2 so provider
 	// tokens can never be confused with TACOS user tokens.
 	r.HandleFunc(providerapi.SecretsReadPath, s.secretsReadHandler)
+	r.HandleFunc(providerapi.SecretKVsWritePath, s.secretKVsWriteHandler)
+	r.HandleFunc(providerapi.SecretKVsDeletePath, s.secretKVsDeleteHandler)
 
 	// All API routes under /api/v2
 	r.Route("/api/v2", func(r chi.Router) {
@@ -70,6 +72,10 @@ func buildRouter(s *Server) http.Handler {
 			r.Get("/organizations/{org}/workspaces/{name}", s.getWorkspaceHandler)
 			r.Post("/organizations/{org}/workspaces", s.createWorkspaceHandler)
 			r.Get("/organizations/{org}/workspaces", s.listWorkspacesHandler)
+
+			// Workspace update (by ID). OpenTofu's cloud backend PATCHes the
+			// terraform-version after auto-creating a workspace.
+			r.Patch("/workspaces/{id}", s.updateWorkspaceHandler)
 
 			// Workspace actions (by ID)
 			r.Post("/workspaces/{id}/actions/lock", s.lockWorkspaceHandler)

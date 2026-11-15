@@ -58,6 +58,35 @@ func (s *Server) createWorkspaceHandler(w http.ResponseWriter, r *http.Request) 
 	jsonAPIResponse(w, http.StatusCreated, workspaceJSON(ws))
 }
 
+// updateWorkspaceHandler implements the PATCH endpoint OpenTofu's cloud
+// backend calls after creating a workspace, to record the local version.
+// Only terraform-version is mutable; omitted attributes keep their value.
+func (s *Server) updateWorkspaceHandler(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var body struct {
+		Data struct {
+			Attributes struct {
+				TerraformVersion *string `json:"terraform-version"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if !decodeJSONBody(w, r, maxWorkspaceBodySize, &body) {
+		return
+	}
+
+	if err := s.store.UpdateWorkspaceTerraformVersion(id, body.Data.Attributes.TerraformVersion); err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	ws, err := s.store.GetWorkspaceByID(id)
+	if err != nil {
+		handleStoreError(w, err)
+		return
+	}
+	jsonAPIResponse(w, http.StatusOK, workspaceJSON(ws))
+}
+
 func (s *Server) listWorkspacesHandler(w http.ResponseWriter, r *http.Request) {
 	org := chi.URLParam(r, "org")
 	namePrefix := r.URL.Query().Get("search[name]")

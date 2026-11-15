@@ -26,7 +26,7 @@ func TestClientReadSecret(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"name":"bootstrap","values":{"a":"1","b":"two\nlines"}}`)
+		io.WriteString(w, `{"name":"bootstrap","values":{"a":"1","b":"two\nlines"},"ephemeral_marks":{"a":false,"b":true}}`)
 	}))
 	defer ts.Close()
 
@@ -47,10 +47,106 @@ func TestClientReadSecret(t *testing.T) {
 	if gotCacheControl != "no-store" {
 		t.Fatalf("Cache-Control = %q", gotCacheControl)
 	}
-	if gotBody.Name != "bootstrap" {
+	if gotBody.Name != "bootstrap" || gotBody.Access != SecretAccessEphemeral {
 		t.Fatalf("request = %+v", gotBody)
 	}
 	if out.Name != "bootstrap" || out.Values["a"] != "1" || out.Values["b"] != "two\nlines" {
+		t.Fatalf("response = %+v", out)
+	}
+	if out.EphemeralMarks["a"] || !out.EphemeralMarks["b"] {
+		t.Fatalf("marks = %#v", out.EphemeralMarks)
+	}
+}
+
+func TestClientWriteSecretKV(t *testing.T) {
+	var gotPath, gotAuth string
+	var gotBody WriteSecretKVRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"foo","key":"bar","is_ephemeral":true}`)
+	}))
+	defer ts.Close()
+
+	client := &Client{Endpoint: ts.URL, Token: "provider-token"}
+	out, err := client.WriteSecretKV(context.Background(), "foo/bar", "value", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != SecretKVsWritePath {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotAuth != "Bearer provider-token" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if gotBody.Key != "foo/bar" || gotBody.Value != "value" || gotBody.IsEphemeral == nil || !*gotBody.IsEphemeral {
+		t.Fatalf("request = %+v", gotBody)
+	}
+	if out.Name != "foo" || out.Key != "bar" || !out.IsEphemeral {
+		t.Fatalf("response = %+v", out)
+	}
+
+	if _, err := client.WriteSecretKV(context.Background(), "foo/bar", "value", false); err != nil {
+		t.Fatal(err)
+	}
+	if gotBody.IsEphemeral == nil || *gotBody.IsEphemeral {
+		t.Fatalf("explicit false was not sent: %+v", gotBody)
+	}
+}
+
+func TestClientDeleteSecretKV(t *testing.T) {
+	var gotPath string
+	var gotBody DeleteSecretKVRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"foo","key":"bar"}`)
+	}))
+	defer ts.Close()
+
+	client := &Client{Endpoint: ts.URL, Token: "provider-token"}
+	out, err := client.DeleteSecretKV(context.Background(), "foo/bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != SecretKVsDeletePath {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotBody.Key != "foo/bar" {
+		t.Fatalf("request = %+v", gotBody)
+	}
+	if out.Name != "foo" || out.Key != "bar" {
+		t.Fatalf("response = %+v", out)
+	}
+}
+
+func TestClientReadPublicSecret(t *testing.T) {
+	var gotBody ReadSecretRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"bootstrap","values":{"a":"1"}}`)
+	}))
+	defer ts.Close()
+
+	client := &Client{Endpoint: ts.URL, Token: "provider-token"}
+	out, err := client.ReadPublicSecret(context.Background(), "bootstrap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody.Name != "bootstrap" || gotBody.Access != SecretAccessPublic {
+		t.Fatalf("request = %+v", gotBody)
+	}
+	if out.Name != "bootstrap" || out.Values["a"] != "1" {
 		t.Fatalf("response = %+v", out)
 	}
 }

@@ -46,6 +46,10 @@ var (
 	ErrSecretInvalidValue = errors.New("invalid secret value")
 	// ErrSecretLimitExceeded reports a KV count or total-size limit.
 	ErrSecretLimitExceeded = errors.New("secret limit exceeded")
+	// ErrSecretSchemaOutdated reports a database created before
+	// secret_kvs.is_ephemeral existed. mgcl never migrates such a database
+	// automatically.
+	ErrSecretSchemaOutdated = errors.New("secret database schema is outdated: secret_kvs.is_ephemeral is missing; run mgcl-migrate to migrate this database")
 )
 
 var secretNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -60,9 +64,10 @@ type SecretSummary struct {
 
 // SecretKeyMetadata is the plaintext metadata of one KV entry.
 type SecretKeyMetadata struct {
-	Key       string
-	CreatedAt string
-	UpdatedAt string
+	Key         string
+	CreatedAt   string
+	UpdatedAt   string
+	IsEphemeral bool
 }
 
 // SecretDetails is the plaintext metadata of one Secret. It never contains a
@@ -252,6 +257,9 @@ func (s *SecretStore) ListSecrets() ([]SecretSummary, error) {
 	if !exists {
 		return []SecretSummary{}, nil
 	}
+	if err := requireSecretSchema(s.db); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(
 		`SELECT s.name, s.created_at, s.updated_at, COUNT(k.key)
 		FROM secrets s LEFT JOIN secret_kvs k ON k.secret_id = s.id
@@ -285,6 +293,9 @@ func (s *SecretStore) ShowSecret(name string) (*SecretDetails, error) {
 	if !exists {
 		return nil, ErrSecretNotFound
 	}
+	if err := requireSecretSchema(s.db); err != nil {
+		return nil, err
+	}
 
 	tx, err := beginSecretReadTx(s.db)
 	if err != nil {
@@ -304,7 +315,7 @@ func (s *SecretStore) ShowSecret(name string) (*SecretDetails, error) {
 	}
 
 	rows, err := tx.Query(
-		`SELECT key, created_at, updated_at FROM secret_kvs WHERE secret_id = ? ORDER BY key`,
+		`SELECT key, created_at, updated_at, is_ephemeral FROM secret_kvs WHERE secret_id = ? ORDER BY key`,
 		out.ID,
 	)
 	if err != nil {
@@ -313,10 +324,12 @@ func (s *SecretStore) ShowSecret(name string) (*SecretDetails, error) {
 	out.Keys = make([]SecretKeyMetadata, 0)
 	for rows.Next() {
 		var key SecretKeyMetadata
-		if err := rows.Scan(&key.Key, &key.CreatedAt, &key.UpdatedAt); err != nil {
+		var isEphemeral int
+		if err := rows.Scan(&key.Key, &key.CreatedAt, &key.UpdatedAt, &isEphemeral); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		key.IsEphemeral = isEphemeral != 0
 		out.Keys = append(out.Keys, key)
 	}
 	if err := rows.Close(); err != nil {
@@ -392,8 +405,19 @@ func (s *SecretStore) CreateSecret(name string) (*SecretDetails, error) {
 }
 
 // SetSecretValue writes or overwrites one KV. The Secret must already exist and
-// its DEK must unwrap with the current recipient.
+// its DEK must unwrap with the current recipient. The Secret's visibility is
+// unchanged.
 func (s *SecretStore) SetSecretValue(name, key string, value []byte) error {
+	return s.SetSecretValueWithPublic(name, key, value, false)
+}
+
+// SetSecretValueWithPublic writes or overwrites one KV. When public is true,
+// only that KV is marked public (is_ephemeral = 0) in the same transaction as
+// the value write; other KVs keep their marks. When public is false, the KV
+// keeps its existing mark, and a new KV defaults to ephemeral. The Secret must
+// already exist and its DEK must unwrap with the current recipient before any
+// row is modified.
+func (s *SecretStore) SetSecretValueWithPublic(name, key string, value []byte, public bool) error {
 	if !ValidSecretName(name) {
 		return fmt.Errorf("invalid secret name %q", name)
 	}
@@ -444,8 +468,20 @@ func (s *SecretStore) SetSecretValue(name, key string, value []byte) error {
 		return err
 	}
 	now := nowISO()
+	ephemeralMark := 1
+	if public {
+		ephemeralMark = 0
+	}
 	if exists {
-		if _, err := tx.Exec(
+		if public {
+			if _, err := tx.Exec(
+				`UPDATE secret_kvs SET suite = ?, nonce = ?, ciphertext = ?, updated_at = ?, is_ephemeral = 0
+				WHERE secret_id = ? AND key = ?`,
+				cryptSuite, nonce, ciphertext, now, secretID, key,
+			); err != nil {
+				return fmt.Errorf("update secret value: %w", err)
+			}
+		} else if _, err := tx.Exec(
 			`UPDATE secret_kvs SET suite = ?, nonce = ?, ciphertext = ?, updated_at = ?
 			WHERE secret_id = ? AND key = ?`,
 			cryptSuite, nonce, ciphertext, now, secretID, key,
@@ -454,9 +490,9 @@ func (s *SecretStore) SetSecretValue(name, key string, value []byte) error {
 		}
 	} else {
 		if _, err := tx.Exec(
-			`INSERT INTO secret_kvs (secret_id, key, suite, nonce, ciphertext, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			secretID, key, cryptSuite, nonce, ciphertext, now, now,
+			`INSERT INTO secret_kvs (secret_id, key, suite, nonce, ciphertext, is_ephemeral, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			secretID, key, cryptSuite, nonce, ciphertext, ephemeralMark, now, now,
 		); err != nil {
 			return fmt.Errorf("insert secret value: %w", err)
 		}
@@ -484,6 +520,9 @@ func (s *SecretStore) GetSecretValue(name, key string) ([]byte, error) {
 	}
 	if !exists {
 		return nil, ErrSecretNotFound
+	}
+	if err := requireSecretSchema(s.db); err != nil {
+		return nil, err
 	}
 
 	tx, err := beginSecretReadTx(s.db)
@@ -640,76 +679,103 @@ func (s *SecretStore) preflightSecret(name string) (string, int, error) {
 	return secretID, count, nil
 }
 
-// ReadSecretValues returns the current values of one Secret.
+// ReadSecretValues returns the current values of every KV in one Secret.
 func (s *SecretStore) ReadSecretValues(name string) (map[string]string, error) {
-	return readSecretValues(context.Background(), s.db, s.identity, name)
+	values, _, err := readSecretValues(context.Background(), s.db, s.identity, name, true)
+	return values, err
 }
 
-// ReadSecretValues returns the current values of one Secret.
+// ReadSecretValues returns the current values of every KV in one Secret.
 func (s *Store) ReadSecretValues(name string) (map[string]string, error) {
-	return readSecretValues(context.Background(), s.db, s.identity, name)
+	values, _, err := readSecretValues(context.Background(), s.db, s.identity, name, true)
+	return values, err
 }
 
-// ReadSecretValuesContext reads values with the caller's request context. The
-// provider API uses this so a canceled request also cancels its read snapshot.
+// ReadSecretValuesContext reads every KV of one Secret with the caller's
+// request context. The provider API uses this so a canceled request also
+// cancels its read snapshot.
 func (s *Store) ReadSecretValuesContext(ctx context.Context, name string) (map[string]string, error) {
-	return readSecretValues(ctx, s.db, s.identity, name)
+	values, _, err := readSecretValues(ctx, s.db, s.identity, name, true)
+	return values, err
 }
 
-func readSecretValues(ctx context.Context, db *sql.DB, identity *Identity, name string) (map[string]string, error) {
+// ReadSecretValuesContextAccess reads one Secret's KVs and their access marks.
+// allKeys true returns every KV; false returns only KVs with is_ephemeral = 0
+// and never selects or decrypts ephemeral KVs. It returns empty maps when no
+// KV matches.
+func (s *Store) ReadSecretValuesContextAccess(ctx context.Context, name string, allKeys bool) (map[string]string, map[string]bool, error) {
+	return readSecretValues(ctx, s.db, s.identity, name, allKeys)
+}
+
+func readSecretValues(ctx context.Context, db *sql.DB, identity *Identity, name string, allKeys bool) (map[string]string, map[string]bool, error) {
 	if !ValidSecretName(name) {
-		return nil, errors.New("invalid secret name")
+		return nil, nil, errors.New("invalid secret name")
 	}
 	if identity == nil {
-		return nil, errors.New("encryption identity is required")
+		return nil, nil, errors.New("encryption identity is required")
 	}
 	exists, err := secretTablesExist(db)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !exists {
-		return nil, ErrSecretNotFound
+		return nil, nil, ErrSecretNotFound
+	}
+	if err := requireSecretSchema(db); err != nil {
+		return nil, nil, err
 	}
 
 	tx, err := beginSecretReadTxContext(ctx, db)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tx.Rollback()
 
-	secretID, dek, err := unlockSecretDEKTx(tx, identity, name)
+	secretID, err := secretIDTx(tx, name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	dek, err := unlockSecretDEKByIDTx(tx, identity, secretID)
+	if err != nil {
+		return nil, nil, err
 	}
 	defer clearBytes(dek)
 
-	rows, err := tx.QueryContext(ctx, `SELECT key, suite, nonce, ciphertext FROM secret_kvs WHERE secret_id = ? ORDER BY key`, secretID)
+	query := `SELECT key, suite, nonce, ciphertext, is_ephemeral FROM secret_kvs WHERE secret_id = ?`
+	if !allKeys {
+		query += ` AND is_ephemeral = 0`
+	}
+	query += ` ORDER BY key`
+	rows, err := tx.QueryContext(ctx, query, secretID)
 	if err != nil {
-		return nil, fmt.Errorf("read secret values: %w", err)
+		return nil, nil, fmt.Errorf("read secret values: %w", err)
 	}
 	defer rows.Close()
 
 	values := make(map[string]string)
+	marks := make(map[string]bool)
 	for rows.Next() {
 		var key string
 		var suite int
 		var nonce, ciphertext []byte
-		if err := rows.Scan(&key, &suite, &nonce, &ciphertext); err != nil {
-			return nil, err
+		var isEphemeral int
+		if err := rows.Scan(&key, &suite, &nonce, &ciphertext, &isEphemeral); err != nil {
+			return nil, nil, err
 		}
 		if suite != cryptSuite {
-			return nil, fmt.Errorf("%w: unsupported secret value suite", ErrSecretCorrupt)
+			return nil, nil, fmt.Errorf("%w: unsupported secret value suite", ErrSecretCorrupt)
 		}
 		plaintext, err := openSecretValue(dek, secretID, key, nonce, ciphertext)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		values[key] = string(plaintext)
+		marks[key] = isEphemeral != 0
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return values, nil
+	return values, marks, nil
 }
 
 func unlockSecretDEKTx(tx *sql.Tx, identity *Identity, name string) (string, []byte, error) {
@@ -717,8 +783,16 @@ func unlockSecretDEKTx(tx *sql.Tx, identity *Identity, name string) (string, []b
 	if err != nil {
 		return "", nil, err
 	}
+	dek, err := unlockSecretDEKByIDTx(tx, identity, secretID)
+	if err != nil {
+		return "", nil, err
+	}
+	return secretID, dek, nil
+}
+
+func unlockSecretDEKByIDTx(tx *sql.Tx, identity *Identity, secretID string) ([]byte, error) {
 	record := &wrappedSecretDEKRecord{}
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		`SELECT dek_fingerprint, recipient_fingerprint, suite, ephemeral_public_key, hkdf_salt, nonce, wrapped_dek
 		FROM secret_deks WHERE secret_id = ?`, secretID,
 	).Scan(
@@ -726,16 +800,12 @@ func unlockSecretDEKTx(tx *sql.Tx, identity *Identity, name string) (string, []b
 		&record.EphemeralPublicKey, &record.HKDFSalt, &record.Nonce, &record.WrappedDEK,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil, fmt.Errorf("%w: secret key metadata is missing", ErrSecretCorrupt)
+		return nil, fmt.Errorf("%w: secret key metadata is missing", ErrSecretCorrupt)
 	}
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
-	dek, err := unwrapSecretDEK(identity, secretID, record)
-	if err != nil {
-		return "", nil, err
-	}
-	return secretID, dek, nil
+	return unwrapSecretDEK(identity, secretID, record)
 }
 
 func secretIDTx(tx *sql.Tx, name string) (string, error) {
@@ -805,8 +875,209 @@ func secretTablesExist(db *sql.DB) (bool, error) {
 	return true, nil
 }
 
+// rowQuerier is satisfied by *sql.DB and *sql.Tx.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// requireSecretSchema verifies that the existing secret_kvs table has the
+// is_ephemeral column. It never alters the database. Callers that accept an
+// empty database must check secretTablesExist first.
+func requireSecretSchema(q rowQuerier) error {
+	var count int
+	if err := q.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('secret_kvs') WHERE name = 'is_ephemeral'`,
+	).Scan(&count); err != nil {
+		return fmt.Errorf("check secret schema: %w", err)
+	}
+	if count == 0 {
+		return ErrSecretSchemaOutdated
+	}
+	return nil
+}
+
 func isUniqueConstraint(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE")
+}
+
+// WriteSecretKVContext creates or overwrites one KV and, when the Secret does
+// not exist yet, creates the Secret and its independent DEK in the same
+// transaction. isEphemeral sets only this KV's access mark. The provider API
+// uses this entry point for managed-resource writes.
+func (s *Store) WriteSecretKVContext(ctx context.Context, ref string, value []byte, isEphemeral bool) (string, string, error) {
+	name, key, err := ParseSecretReference(ref)
+	if err != nil {
+		return "", "", err
+	}
+	if err := requireSecretSchema(s.db); err != nil {
+		return "", "", err
+	}
+	if !utf8.Valid(value) {
+		return "", "", fmt.Errorf("%w: value must be valid UTF-8", ErrSecretInvalidValue)
+	}
+	if len(value) > MaxSecretValueBytes {
+		return "", "", fmt.Errorf("%w: value exceeds %d bytes", ErrSecretInvalidValue, MaxSecretValueBytes)
+	}
+
+	release, err := s.beginWrite()
+	if err != nil {
+		return "", "", err
+	}
+	defer release()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+
+	now := nowISO()
+	var secretID string
+	var dek []byte
+	err = tx.QueryRowContext(ctx, `SELECT id FROM secrets WHERE name = ?`, name).Scan(&secretID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		secretID, err = newSecretID()
+		if err != nil {
+			return "", "", err
+		}
+		var record *wrappedSecretDEKRecord
+		dek, record, err = newWrappedSecretDEK(s.identity, secretID)
+		if err != nil {
+			return "", "", err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO secrets (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			secretID, name, now, now,
+		); err != nil {
+			return "", "", fmt.Errorf("create secret: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO secret_deks
+			(secret_id, dek_fingerprint, recipient_fingerprint, suite, ephemeral_public_key, hkdf_salt, nonce, wrapped_dek, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			secretID, record.DEKFingerprint, record.RecipientFingerprint, record.Suite,
+			record.EphemeralPublicKey, record.HKDFSalt, record.Nonce, record.WrappedDEK, now,
+		); err != nil {
+			return "", "", fmt.Errorf("create secret key: %w", err)
+		}
+	case err != nil:
+		return "", "", err
+	default:
+		dek, err = unlockSecretDEKByIDTx(tx, s.identity, secretID)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	defer clearBytes(dek)
+
+	count, total, exists, err := secretKVUsageTx(tx, secretID, key, len(value))
+	if err != nil {
+		return "", "", err
+	}
+	if !exists {
+		count++
+	}
+	if count > MaxSecretKVs {
+		return "", "", fmt.Errorf("%w: a secret may contain at most %d keys", ErrSecretLimitExceeded, MaxSecretKVs)
+	}
+	if total > MaxSecretTotalBytes {
+		return "", "", fmt.Errorf("%w: values exceed %d bytes", ErrSecretLimitExceeded, MaxSecretTotalBytes)
+	}
+
+	nonce, ciphertext, err := sealSecretValue(dek, secretID, key, value)
+	if err != nil {
+		return "", "", err
+	}
+	mark := 1
+	if !isEphemeral {
+		mark = 0
+	}
+	if exists {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE secret_kvs SET suite = ?, nonce = ?, ciphertext = ?, is_ephemeral = ?, updated_at = ?
+			WHERE secret_id = ? AND key = ?`,
+			cryptSuite, nonce, ciphertext, mark, now, secretID, key,
+		); err != nil {
+			return "", "", fmt.Errorf("update secret value: %w", err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO secret_kvs (secret_id, key, suite, nonce, ciphertext, is_ephemeral, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			secretID, key, cryptSuite, nonce, ciphertext, mark, now, now,
+		); err != nil {
+			return "", "", fmt.Errorf("insert secret value: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE secrets SET updated_at = ? WHERE id = ?`, now, secretID); err != nil {
+		return "", "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", err
+	}
+	if err := s.markDirty(); err != nil {
+		return "", "", err
+	}
+	return name, key, nil
+}
+
+// DeleteSecretKVContext deletes one KV. A missing Secret or KV succeeds
+// without creating anything, and the Secret (including an empty Secret) is
+// never deleted. No DEK unwrap is needed.
+func (s *Store) DeleteSecretKVContext(ctx context.Context, ref string) (string, string, error) {
+	name, key, err := ParseSecretReference(ref)
+	if err != nil {
+		return "", "", err
+	}
+	if err := requireSecretSchema(s.db); err != nil {
+		return "", "", err
+	}
+
+	release, err := s.beginWrite()
+	if err != nil {
+		return "", "", err
+	}
+	defer release()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+
+	var secretID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM secrets WHERE name = ?`, name).Scan(&secretID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return name, key, nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM secret_kvs WHERE secret_id = ? AND key = ?`, secretID, key)
+	if err != nil {
+		return "", "", fmt.Errorf("delete secret value: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", "", err
+	}
+	changed := n > 0
+	if changed {
+		if _, err := tx.ExecContext(ctx, `UPDATE secrets SET updated_at = ? WHERE id = ?`, nowISO(), secretID); err != nil {
+			return "", "", err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", err
+	}
+	if changed {
+		if err := s.markDirty(); err != nil {
+			return "", "", err
+		}
+	}
+	return name, key, nil
 }
 
 // newSecretID returns a random UUID v4.

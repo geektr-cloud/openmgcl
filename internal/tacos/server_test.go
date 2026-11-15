@@ -92,6 +92,25 @@ func postJSON(t *testing.T, url string, body any, token string) *http.Response {
 	return resp
 }
 
+func patchJSON(t *testing.T, url string, body any, token string) *http.Response {
+	t.Helper()
+	if token == "" {
+		token = testUserToken
+	}
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(body)
+	req, _ := http.NewRequest("PATCH", url, &buf)
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 func putBytes(t *testing.T, url string, data []byte) *http.Response {
 	t.Helper()
 	req, _ := http.NewRequest("PUT", url, bytes.NewReader(data))
@@ -229,6 +248,156 @@ func TestWorkspaceCRUD(t *testing.T) {
 	pag := meta["pagination"].(map[string]any)
 	if int(pag["total-count"].(float64)) != 2 {
 		t.Errorf("total-count = %v, want 2", pag["total-count"])
+	}
+}
+
+func TestUpdateWorkspaceTerraformVersion(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	defer ts.Close()
+
+	// Create a workspace with an initial version and lock it so the update is
+	// checked against unrelated columns.
+	resp := postJSON(t, ts.URL+"/api/v2/organizations/dev/workspaces", map[string]any{
+		"data": map[string]any{
+			"attributes": map[string]any{"name": "upd", "terraform-version": "1.0.0"},
+		},
+	}, "")
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create ws: status = %d, want 201: %s", resp.StatusCode, body)
+	}
+	created := decodeJSON(t, resp)
+	resp.Body.Close()
+	createdData := created["data"].(map[string]any)
+	wsID := createdData["id"].(string)
+	createdAttrs := createdData["attributes"].(map[string]any)
+	createdAt := createdAttrs["created-at"]
+
+	resp = postJSON(t, fmt.Sprintf("%s/api/v2/workspaces/%s/actions/lock", ts.URL, wsID), map[string]any{
+		"reason": "keep",
+	}, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lock ws: status = %d, want 200", resp.StatusCode)
+	}
+
+	wsURL := fmt.Sprintf("%s/api/v2/workspaces/%s", ts.URL, wsID)
+
+	// OpenTofu cloud backend sends a single terraform-version attribute.
+	resp = patchJSON(t, wsURL, map[string]any{
+		"data": map[string]any{
+			"type": "workspaces",
+			"id":   wsID,
+			"attributes": map[string]any{
+				"terraform-version": "1.13.9",
+				"name":              "renamed",
+			},
+		},
+	}, "")
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("patch ws: status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	patched := decodeJSON(t, resp)
+	resp.Body.Close()
+	patchedAttrs := patched["data"].(map[string]any)["attributes"].(map[string]any)
+	if patchedAttrs["terraform-version"] != "1.13.9" {
+		t.Errorf("terraform-version = %v, want 1.13.9", patchedAttrs["terraform-version"])
+	}
+	if patchedAttrs["name"] != "upd" {
+		t.Errorf("name = %v, want upd (PATCH must not rename)", patchedAttrs["name"])
+	}
+	if patchedAttrs["execution-mode"] != "local" {
+		t.Errorf("execution-mode = %v, want local", patchedAttrs["execution-mode"])
+	}
+	if patchedAttrs["locked"] != true {
+		t.Errorf("locked = %v, want true", patchedAttrs["locked"])
+	}
+	if patchedAttrs["created-at"] != createdAt {
+		t.Errorf("created-at changed: %v -> %v", createdAt, patchedAttrs["created-at"])
+	}
+
+	// GET must see the persisted version.
+	resp = get(t, ts.URL+"/api/v2/organizations/dev/workspaces/upd", "")
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("get ws: status = %d, want 200", resp.StatusCode)
+	}
+	gotAttrs := decodeJSON(t, resp)["data"].(map[string]any)["attributes"].(map[string]any)
+	resp.Body.Close()
+	if gotAttrs["terraform-version"] != "1.13.9" {
+		t.Errorf("persisted terraform-version = %v, want 1.13.9", gotAttrs["terraform-version"])
+	}
+
+	// An omitted attribute preserves the stored value.
+	resp = patchJSON(t, wsURL, map[string]any{
+		"data": map[string]any{"attributes": map[string]any{}},
+	}, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch without version: status = %d, want 200", resp.StatusCode)
+	}
+	resp = get(t, ts.URL+"/api/v2/organizations/dev/workspaces/upd", "")
+	gotAttrs = decodeJSON(t, resp)["data"].(map[string]any)["attributes"].(map[string]any)
+	resp.Body.Close()
+	if gotAttrs["terraform-version"] != "1.13.9" {
+		t.Errorf("version after omitted attribute = %v, want 1.13.9", gotAttrs["terraform-version"])
+	}
+
+	// An explicit empty version follows CreateWorkspace's default.
+	resp = patchJSON(t, wsURL, map[string]any{
+		"data": map[string]any{"attributes": map[string]any{"terraform-version": ""}},
+	}, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch empty version: status = %d, want 200", resp.StatusCode)
+	}
+	resp = get(t, ts.URL+"/api/v2/organizations/dev/workspaces/upd", "")
+	gotAttrs = decodeJSON(t, resp)["data"].(map[string]any)["attributes"].(map[string]any)
+	resp.Body.Close()
+	if gotAttrs["terraform-version"] != "latest" {
+		t.Errorf("version after empty attribute = %v, want latest", gotAttrs["terraform-version"])
+	}
+
+	// Unknown workspace → 404, with and without an attribute.
+	for name, body := range map[string]map[string]any{
+		"with-version": {"data": map[string]any{"attributes": map[string]any{"terraform-version": "1.13.9"}}},
+		"without":      {"data": map[string]any{"attributes": map[string]any{}}},
+	} {
+		resp = patchJSON(t, ts.URL+"/api/v2/workspaces/ws-does-not-exist", body, "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: status = %d, want 404", name, resp.StatusCode)
+		}
+	}
+
+	// Malformed JSON → 400.
+	req, _ := http.NewRequest("PATCH", wsURL, bytes.NewReader([]byte(`{"data":`)))
+	req.Header.Set("Authorization", "Bearer "+testUserToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("invalid JSON: status = %d, want 400", resp.StatusCode)
+	}
+
+	// Wrong token → 401 and no state change.
+	resp = patchJSON(t, wsURL, map[string]any{
+		"data": map[string]any{"attributes": map[string]any{"terraform-version": "9.9.9"}},
+	}, "wrong-token")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong token: status = %d, want 401", resp.StatusCode)
+	}
+	resp = get(t, ts.URL+"/api/v2/organizations/dev/workspaces/upd", "")
+	gotAttrs = decodeJSON(t, resp)["data"].(map[string]any)["attributes"].(map[string]any)
+	resp.Body.Close()
+	if gotAttrs["terraform-version"] != "latest" {
+		t.Errorf("version after unauthorized patch = %v, want latest", gotAttrs["terraform-version"])
 	}
 }
 

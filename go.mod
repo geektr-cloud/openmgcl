@@ -4,6 +4,7 @@ go 1.27.4
 
 require (
 	filippo.io/edwards25519 v1.2.0
+	github.com/dustin/go-humanize v1.0.1
 	github.com/geektheripper/go-gutils/git/git_utils v0.1.0
 	github.com/go-chi/chi/v5 v5.3.1
 	github.com/spf13/cobra v1.10.2
@@ -15,7 +16,6 @@ require (
 )
 
 require (
-	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect

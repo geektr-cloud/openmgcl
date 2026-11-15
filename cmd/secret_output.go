@@ -19,9 +19,10 @@ type secretListView struct {
 }
 
 type secretKeyView struct {
-	Key       string `json:"key" yaml:"key"`
-	CreatedAt string `json:"created_at" yaml:"created_at"`
-	UpdatedAt string `json:"updated_at" yaml:"updated_at"`
+	Key         string `json:"key" yaml:"key"`
+	CreatedAt   string `json:"created_at" yaml:"created_at"`
+	UpdatedAt   string `json:"updated_at" yaml:"updated_at"`
+	IsEphemeral bool   `json:"is_ephemeral" yaml:"is_ephemeral"`
 }
 
 type secretDetailsView struct {
@@ -30,6 +31,13 @@ type secretDetailsView struct {
 	CreatedAt string          `json:"created_at" yaml:"created_at"`
 	UpdatedAt string          `json:"updated_at" yaml:"updated_at"`
 	Keys      []secretKeyView `json:"keys" yaml:"keys"`
+}
+
+func secretAccessLabel(isEphemeral bool) string {
+	if isEphemeral {
+		return "ephemeral"
+	}
+	return "public"
 }
 
 func writeSecretList(cmd *cobra.Command, secrets []tacos.SecretSummary) error {
@@ -71,9 +79,10 @@ func secretDetailsToView(details *tacos.SecretDetails) secretDetailsView {
 	keys := make([]secretKeyView, 0, len(details.Keys))
 	for _, key := range details.Keys {
 		keys = append(keys, secretKeyView{
-			Key:       key.Key,
-			CreatedAt: key.CreatedAt,
-			UpdatedAt: key.UpdatedAt,
+			Key:         key.Key,
+			CreatedAt:   key.CreatedAt,
+			UpdatedAt:   key.UpdatedAt,
+			IsEphemeral: key.IsEphemeral,
 		})
 	}
 	return secretDetailsView{
@@ -96,9 +105,9 @@ func writeSecretDetailsTable(out io.Writer, details *tacos.SecretDetails) error 
 	}
 	fmt.Fprintln(out, "Keys:")
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "  KEY\tCREATED\tUPDATED")
+	fmt.Fprintln(w, "  KEY\tCREATED\tUPDATED\tACCESS")
 	for _, key := range details.Keys {
-		fmt.Fprintf(w, "  %s\t%s\t%s\n", key.Key, key.CreatedAt, key.UpdatedAt)
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", key.Key, key.CreatedAt, key.UpdatedAt, secretAccessLabel(key.IsEphemeral))
 	}
 	return w.Flush()
 }

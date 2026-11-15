@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/geektr-cloud/openmgcl/internal/sqlitebackup"
@@ -18,16 +17,12 @@ type secretFlags struct {
 	keyFile  string
 	backupTo []string
 	useStdin bool
+	public   bool
 	yes      bool
 	output   string
 }
 
-type secretOptions struct {
-	dbPath      string
-	keyFile     string
-	backupSpecs []string
-	backupBase  string
-}
+type secretOptions = offlineOptions
 
 func newSecretCmd() *cobra.Command {
 	flags := &secretFlags{}
@@ -39,6 +34,11 @@ func newSecretCmd() *cobra.Command {
 Secret names and KV keys match ^[a-z0-9][a-z0-9_-]{0,63}$. A KV reference is
 <secret-name>/<key>. Values are always encrypted at rest with a per-Secret DEK,
 which is wrapped by the configured SSH Ed25519 recipient.
+
+New KVs are ephemeral (is_ephemeral = 1) and are returned to every mgcl_secret
+read. Use "secret set --public" to mark only that KV public (is_ephemeral = 0)
+so public provider functions can read it too. public does not mean plaintext:
+values stay encrypted and still require the private key.
 
 Configuration follows mgcl run: --db (or MGCL_DB, or db in .mgcl.yaml) is
 required. --encryption-key-file (or MGCL_ENCRYPTION_KEY_FILE, or
@@ -121,7 +121,13 @@ The value can come from three mutually exclusive sources:
      type it and press Enter. The prompt is written to stderr.
 
 A new key sets created_at and updated_at; overwriting preserves created_at and
-updates updated_at. Only the latest value is stored.`,
+updates updated_at. Only the latest value is stored.
+
+--public marks only this KV public (is_ephemeral = 0) in the same transaction
+as the value write; other KVs keep their marks. new KVs default to ephemeral.
+The access mark is one-way: there is no flag to convert it back. public does
+not mean plaintext: values are still encrypted at rest and still require the
+private key. A plain set keeps an existing KV's mark unchanged.`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name, key, err := tacos.ParseSecretReference(args[0])
@@ -137,14 +143,19 @@ updates updated_at. Only the latest value is stored.`,
 				return err
 			}
 			return withSecretWriteStore(cmd, flags, false, !flags.useStdin, func(store *tacos.SecretStore) (string, error) {
-				if err := store.SetSecretValue(name, key, value); err != nil {
+				if err := store.SetSecretValueWithPublic(name, key, value, flags.public); err != nil {
 					return "", err
 				}
-				return fmt.Sprintf("Set %s/%s.", name, key), nil
+				message := fmt.Sprintf("Set %s/%s.", name, key)
+				if flags.public {
+					message += fmt.Sprintf("\nKV %s/%s is public.", name, key)
+				}
+				return message, nil
 			})
 		},
 	}
 	setCmd.Flags().BoolVar(&flags.useStdin, "stdin", false, "Read the value from stdin until EOF")
+	setCmd.Flags().BoolVar(&flags.public, "public", false, "Mark this KV public (is_ephemeral=0) in the same transaction")
 
 	getCmd := &cobra.Command{
 		Use:   "get <secret-name>/<key>",
@@ -357,47 +368,9 @@ func abortManager(manager *sqlitebackup.Manager) {
 }
 
 func resolveSecretOptions(cmd *cobra.Command, flags *secretFlags, withBackup, needIdentity bool) (*secretOptions, error) {
-	config, projectRoot, err := newConfig()
-	if err != nil {
-		return nil, err
-	}
-	opts := &secretOptions{}
-
-	if cmd.Flags().Changed("db") {
-		opts.dbPath = flags.db
-	} else if value := os.Getenv("MGCL_DB"); value != "" {
-		opts.dbPath = value
-	} else if value := config.GetString("db"); value != "" {
-		opts.dbPath = resolveConfigDBPath(value, projectRoot)
-	}
-
-	if cmd.Flags().Changed("encryption-key-file") {
-		opts.keyFile = flags.keyFile
-	} else if value := os.Getenv("MGCL_ENCRYPTION_KEY_FILE"); value != "" {
-		opts.keyFile = value
-	} else if value := config.GetString("encryption_key_file"); value != "" {
-		opts.keyFile = value
-	}
-	if needIdentity && opts.keyFile == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("resolve home directory for encryption key: %w", err)
-		}
-		opts.keyFile = filepath.Join(home, ".ssh", "id_ed25519")
-	}
-
-	if withBackup {
-		specs, err := backupListFromConfig(config.Get("backup_to"))
-		if err != nil {
-			return nil, err
-		}
-		if cmd.Flags().Changed("backup-to") {
-			opts.backupSpecs = flags.backupTo
-			opts.backupBase = ""
-		} else {
-			opts.backupSpecs = specs
-			opts.backupBase = projectRoot
-		}
-	}
-	return opts, nil
+	return resolveOfflineOptions(cmd, offlineFlagValues{
+		db:       flags.db,
+		keyFile:  flags.keyFile,
+		backupTo: flags.backupTo,
+	}, withBackup, needIdentity)
 }

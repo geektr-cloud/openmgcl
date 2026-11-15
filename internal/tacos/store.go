@@ -144,6 +144,21 @@ func migrate(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
+	// Never add the KV access mark to a pre-existing secret schema. The
+	// external mgcl-migrate tool owns that one-time conversion. A brand-new
+	// database has neither table and is created below with the current schema.
+	var existingSecretTables int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('secrets', 'secret_kvs')`,
+	).Scan(&existingSecretTables); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if existingSecretTables > 0 {
+		if err := requireSecretSchema(tx); err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS workspaces (
 			id TEXT PRIMARY KEY,
@@ -212,6 +227,7 @@ func migrate(db *sql.DB) error {
 			suite INTEGER NOT NULL,
 			nonce BLOB NOT NULL,
 			ciphertext BLOB NOT NULL,
+			is_ephemeral INTEGER NOT NULL DEFAULT 1 CHECK (is_ephemeral IN (0, 1)),
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY (secret_id, key)
@@ -221,6 +237,9 @@ func migrate(db *sql.DB) error {
 		if _, err := tx.Exec(s); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
+	}
+	if err := requireSecretSchema(tx); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -280,6 +299,39 @@ func (s *Store) CreateWorkspace(org, name, tfVersion string) (*Workspace, error)
 		return nil, err
 	}
 	return s.GetWorkspaceByID(id)
+}
+
+// UpdateWorkspaceTerraformVersion updates one workspace's terraform-version.
+// A nil version leaves the stored value unchanged. An empty version follows
+// CreateWorkspace's default and becomes "latest". Returns ErrNotFound for an
+// unknown workspace.
+func (s *Store) UpdateWorkspaceTerraformVersion(wsID string, tfVersion *string) error {
+	release, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if tfVersion == nil {
+		_, err := s.GetWorkspaceByID(wsID)
+		return err
+	}
+	version := *tfVersion
+	if version == "" {
+		version = "latest"
+	}
+	res, err := s.db.Exec(`UPDATE workspaces SET terraform_version = ? WHERE id = ?`, version, wsID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrNotFound("workspace not found")
+	}
+	return s.markDirty()
 }
 
 // GetWorkspace returns a workspace by (organization, name).

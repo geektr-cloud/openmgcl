@@ -121,6 +121,9 @@ func TestSecretCLIHelp(t *testing.T) {
 	if !strings.Contains(stdout, "--stdin") || !strings.Contains(stdout, "shell history") {
 		t.Errorf("secret set --help lacks stdin/history warning:\n%s", stdout)
 	}
+	if !strings.Contains(stdout, "--public") {
+		t.Errorf("secret set --help lacks --public:\n%s", stdout)
+	}
 	stdout, _, err = runCLI(t, "", "secret", "delete", "--help")
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +137,208 @@ func TestSecretCLIHelp(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "--yes-i-know-it-will-publish-state-and-secrets") {
 		t.Errorf("run --help lacks the publish flag:\n%s", stdout)
+	}
+}
+
+func TestSecretCLISetPublic(t *testing.T) {
+	h := newSecretCLI(t)
+	stubNonTTY(t)
+
+	// create has no --public flag.
+	if _, _, err := runCLI(t, "", h.args("create", "rejected", "--public")...); err == nil {
+		t.Fatal("create accepted --public")
+	}
+	if _, _, err := runCLI(t, "", h.args("create", "bootstrap")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "", h.args("set", "bootstrap/key", "before")...); err != nil {
+		t.Fatal(err)
+	}
+
+	showJSON := func(name string) map[string]any {
+		t.Helper()
+		stdout, _, err := runCLI(t, "", h.args("show", name, "-o", "json")...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var view map[string]any
+		if err := json.Unmarshal([]byte(stdout), &view); err != nil {
+			t.Fatal(err)
+		}
+		return view
+	}
+	keyMark := func(view map[string]any, key string) bool {
+		t.Helper()
+		keys, _ := view["keys"].([]any)
+		for _, item := range keys {
+			entry, _ := item.(map[string]any)
+			if entry["key"] == key {
+				mark, ok := entry["is_ephemeral"].(bool)
+				if !ok {
+					t.Fatalf("key %q lacks boolean is_ephemeral: %#v", key, entry)
+				}
+				return mark
+			}
+		}
+		t.Fatalf("key %q not found in %#v", key, view["keys"])
+		return false
+	}
+	if view := showJSON("bootstrap"); !keyMark(view, "key") {
+		t.Fatalf("new KV is_ephemeral = %#v", view["keys"])
+	}
+	if _, exists := showJSON("bootstrap")["is_ephemeral"]; exists {
+		t.Fatal("Secret-level is_ephemeral is still present")
+	}
+	stdout, _, err := runCLI(t, "", h.args("list")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "ACCESS") {
+		t.Fatalf("Secret list still shows a Secret-level access column:\n%s", stdout)
+	}
+
+	// A second KV stays ephemeral when only the first is marked public.
+	if _, _, err := runCLI(t, "", h.args("set", "bootstrap/other", "other-value")...); err != nil {
+		t.Fatal(err)
+	}
+
+	sqliteBackup := filepath.Join(h.dir, "public-sqlite.db")
+	pathBackup := filepath.Join(h.dir, "public-path.db")
+	args := append(h.args("set", "bootstrap/key", "after", "--public"),
+		"--backup-to", "sqlite:"+sqliteBackup,
+		"--backup-to", "path:"+pathBackup,
+	)
+	_, stderr, err := runCLI(t, "", args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "Set bootstrap/key.") {
+		t.Fatalf("public set stderr lacks Set message: %q", stderr)
+	}
+	if !strings.Contains(stderr, "KV bootstrap/key is public.") {
+		t.Fatalf("public set stderr lacks KV public message: %q", stderr)
+	}
+
+	stdout, _, err = runCLI(t, "", h.args("get", "bootstrap/key")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "after" {
+		t.Fatalf("get after --public = %q", stdout)
+	}
+	view := showJSON("bootstrap")
+	if keyMark(view, "key") {
+		t.Fatal("public KV is still marked ephemeral")
+	}
+	if !keyMark(view, "other") {
+		t.Fatal("--public changed another KV")
+	}
+	badKey := filepath.Join(h.dir, "missing-key")
+	if _, _, err := runCLI(t, "", "secret", "list", "--db", h.db, "--encryption-key-file", badKey); err != nil {
+		t.Fatalf("public list loaded the key: %v", err)
+	}
+	if _, _, err := runCLI(t, "", "secret", "show", "bootstrap", "--db", h.db, "--encryption-key-file", badKey); err != nil {
+		t.Fatalf("public show loaded the key: %v", err)
+	}
+	stdout, _, err = runCLI(t, "", h.args("show", "bootstrap")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "ACCESS") || !strings.Contains(stdout, "public") || !strings.Contains(stdout, "ephemeral") {
+		t.Fatalf("show table lacks per-KV access:\n%s", stdout)
+	}
+	stdout, _, err = runCLI(t, "", h.args("show", "bootstrap", "-o", "yaml")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "is_ephemeral: false") || !strings.Contains(stdout, "is_ephemeral: true") {
+		t.Fatalf("show YAML lacks per-KV is_ephemeral:\n%s", stdout)
+	}
+
+	for _, target := range []string{sqliteBackup, pathBackup} {
+		backupStore, err := openSecretStoreForTest(target, h.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		details, err := backupStore.ShowSecret("bootstrap")
+		if err != nil {
+			backupStore.Close()
+			t.Fatal(err)
+		}
+		value, err := backupStore.GetSecretValue("bootstrap", "key")
+		closeErr := backupStore.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		keyMarks := map[string]bool{}
+		for _, key := range details.Keys {
+			keyMarks[key.Key] = key.IsEphemeral
+		}
+		if keyMarks["key"] {
+			t.Fatalf("%s backup kept the KV ephemeral", target)
+		}
+		if !keyMarks["other"] {
+			t.Fatalf("%s backup changed another KV", target)
+		}
+		if string(value) != "after" {
+			t.Fatalf("%s backup value = %q", target, value)
+		}
+	}
+
+	// Failed writes must not mark a KV public.
+	if _, _, err := runCLI(t, "", h.args("create", "stays")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "", h.args("set", "stays/key", "original")...); err != nil {
+		t.Fatal(err)
+	}
+	otherKey := writeTestIdentity(t, nil)
+	otherArgs := func(rest ...string) []string {
+		base := []string{"secret"}
+		base = append(base, rest...)
+		base = append(base, "--db", h.db, "--encryption-key-file", otherKey)
+		return base
+	}
+	if _, _, err := runCLI(t, "", otherArgs("set", "stays/key", "changed", "--public")...); err == nil {
+		t.Fatal("wrong recipient marked the KV public")
+	}
+	if view := showJSON("stays"); !keyMark(view, "key") {
+		t.Fatalf("failed recipient change is_ephemeral = %#v", view["keys"])
+	}
+	tooLarge := strings.Repeat("x", tacos.MaxSecretValueBytes+1)
+	if _, _, err := runCLI(t, tooLarge, h.args("set", "stays/key", "--stdin", "--public")...); err == nil {
+		t.Fatal("oversized --stdin --public value was accepted")
+	}
+	if view := showJSON("stays"); !keyMark(view, "key") {
+		t.Fatalf("failed oversized write is_ephemeral = %#v", view["keys"])
+	}
+	stdout, _, err = runCLI(t, "", h.args("get", "stays/key")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "original" {
+		t.Fatalf("failed writes changed the value: %q", stdout)
+	}
+
+	// --public works with --stdin and keeps the stdin semantics.
+	if _, _, err := runCLI(t, "", h.args("create", "via-stdin")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "from-stdin\n", h.args("set", "via-stdin/key", "--stdin", "--public")...); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err = runCLI(t, "", h.args("get", "via-stdin/key")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "from-stdin\n" {
+		t.Fatalf("stdin value = %q", stdout)
+	}
+	if view := showJSON("via-stdin"); keyMark(view, "key") {
+		t.Fatalf("stdin --public is_ephemeral = %#v", view["keys"])
 	}
 }
 
@@ -198,6 +403,9 @@ func TestSecretCLIEndToEnd(t *testing.T) {
 	if view["name"] != "bootstrap" {
 		t.Fatalf("show json = %s", stdout)
 	}
+	if _, exists := view["is_ephemeral"]; exists {
+		t.Fatalf("show JSON has Secret-level is_ephemeral: %s", stdout)
+	}
 	if strings.Contains(stdout, "\"keys\": null") {
 		t.Fatalf("show JSON keys is null: %s", stdout)
 	}
@@ -207,6 +415,9 @@ func TestSecretCLIEndToEnd(t *testing.T) {
 	keys, ok := view["keys"].([]any)
 	if !ok || len(keys) != 1 {
 		t.Fatalf("show keys = %#v", view["keys"])
+	}
+	if entry, _ := keys[0].(map[string]any); entry["is_ephemeral"] != true {
+		t.Fatalf("show key mark = %#v", keys[0])
 	}
 
 	stdout, _, err = runCLI(t, "", h.args("show", "bootstrap", "-o", "yaml")...)
@@ -715,6 +926,41 @@ func TestSecretCLIBackupFailureFailsClosed(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Fatalf("backup target was updated despite failure: %q", got)
+	}
+
+	// A failed --public write must not print success or change visibility.
+	stdout, stderr, err = runCLI(t, "", append(h.args("set", "backed/key", "new", "--public"), "--backup-to", backupFlag)...)
+	if err == nil {
+		t.Fatal("public write with failing path backup succeeded")
+	}
+	if stdout != "" {
+		t.Fatalf("failed public write wrote stdout: %q", stdout)
+	}
+	if strings.Contains(stderr, "Set backed/key.") || strings.Contains(stderr, "is public") {
+		t.Fatalf("failed public write printed success: %q", stderr)
+	}
+	backupStore, err = openSecretStoreForTest(target, h.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details, err := backupStore.ShowSecret("backed")
+	if err != nil {
+		backupStore.Close()
+		t.Fatal(err)
+	}
+	got, err = backupStore.GetSecretValue("backed", "key")
+	closeErr = backupStore.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if len(details.Keys) != 1 || !details.Keys[0].IsEphemeral {
+		t.Fatal("failed public write changed the backup KV mark")
+	}
+	if string(got) != "old" {
+		t.Fatalf("failed public write changed the backup value: %q", got)
 	}
 
 	// A target that did not exist must not be generated when the copy fails.

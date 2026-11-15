@@ -147,6 +147,14 @@ mgcl secret list
 mgcl secret show bootstrap
 ```
 
+每个 KV 独立带访问标记。新建 KV 默认是 ephemeral（`is_ephemeral = 1`），会出现在 `mgcl_secret` 的读取中。如果某个值要交给 public provider function，而 function 的返回值可能进入 plan/state 或日志，就用 `--public` 只把这一个 KV 转成 public。`region` 是非敏感的演示值，可以直接作为位置参数，也只把这一个 KV 设为 public：
+
+```bash
+mgcl secret set bootstrap/region us-east-1 --public
+```
+
+真实凭据不这样处理：`access_key_id` 和 `secret_access_key` 保持默认 ephemeral，仍用 `--stdin` 或 TTY 无回显写入。`public` 只决定该 KV 的访问类别，不改变静态加密：数据库里仍是 AES-256-GCM 密文，仍需要私钥。CLI 没有反向 flag（“单向”仅指 CLI）；provider 写 API 可以把已有 KV 的标记改回 ephemeral，managed resource 的 Update 依赖这一点。它只影响目标 KV，同一 Secret 的其他 KV 保持原标记，普通 `set` 也不会重置已有标记。provider 读取时 `access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV；用 `show` 查看每个 KV 的类别。
+
 `main.tf` 用独立的 ephemeral provider 读取：
 
 ```hcl
@@ -163,11 +171,17 @@ ephemeral "mgcl_secret" "bootstrap" {
 }
 
 provider "aws" {
-  region     = "us-east-1"
+  region     = ephemeral.mgcl_secret.bootstrap.values["region"]
   access_key = ephemeral.mgcl_secret.bootstrap.values["access_key_id"]
   secret_key = ephemeral.mgcl_secret.bootstrap.values["secret_access_key"]
 }
+
+output "region" {
+  value = provider::mgcl::secret_value("bootstrap/region")
+}
 ```
+
+`mgcl_secret` 以 `access: "ephemeral"` 返回该 Secret 的全部 KV，所以同一个 Secret 里 public 的 `region` 也能给 aws provider 的 ephemeral 参数用。`secret_value` function 只读取 public KV，而 output 会被持久化，因此这里刻意使用 public 的 `region`；apply 后预期 output 为 `us-east-1`。
 
 provider 已实现但还没发布到 Registry；开发期需要 provider 仓库构建的二进制和 `dev_overrides`。把 `dev_overrides` 写进 OpenTofu 默认 CLI config `~/.tofurc`：
 
@@ -191,6 +205,10 @@ mgcl run -- tofu apply -auto-approve
 `mgcl run` 会自动继承 `~/.tofurc` 并追加本地服务的 host block；显式设置 `TF_CLI_CONFIG_FILE` 时读取该文件，优先于默认 `~/.tofurc`。`dev_overrides` 会跳过该 provider 的 `tofu init`，需要 init 时改用 filesystem mirror。provider 需要 OpenTofu >=1.11。
 
 只有 `mgcl run -- <command>` 会签发 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`；常驻 `mgcl run` 不签发 provider token。TACOS 用户 token 两种模式都会自动生成：子进程模式只写进本次临时 CLI config、不打印，常驻模式在启动后打印一次。Secret 每次 plan/apply 由 provider 重新读取，所以更新 Secret 后下一条命令能读到新值。
+
+带写能力的 managed resource 通过同一 provider token 调用 `secret-kvs:write` / `secret-kvs:delete`。write 会自动创建缺失的 Secret 和 DEK，覆盖同一 KV 的值和标记；delete 幂等，删除最后一个 KV 后保留空 Secret，不会重建 Secret。mgcl 不做 cache invalidation，也不保证跨调用的幂等性判断或事务顺序：不要在同一个 OpenTofu project 里同时用 `mgcl_secret` 读、用 managed resource 写同一个 KV，否则读到旧值或相互覆盖都属预期。
+
+从 v0.1.0 升级的旧 `mgcl.db` 不会自动迁移：先在 `/tmp/mgcl-migrate` 目录构建，再运行 `/tmp/mgcl-migrate/mgcl-migrate ./mgcl.db`（或进入该目录运行 `./mgcl-migrate ./mgcl.db`）一次，之后再用本版本打开。迁移工具删除 `secrets.is_ephemeral`（若存在）并添加 `secret_kvs.is_ephemeral`，忽略旧列值。
 
 ## 6. 改配置，再 apply
 
@@ -235,7 +253,7 @@ rm -f mgcl.db mgcl.db-wal mgcl.db-shm
 1. **`.mgcl.yaml` 可以提交**：只放配置和路径；真实凭据和 Secret value 用 `mgcl secret` 写进加密的 `mgcl.db`，私钥内容永远不进仓库。
 2. **`mgcl.db` 就是 state 和 bootstrap Secret**：不要提交到 git，备份和删除都要像对待 `terraform.tfstate` 一样谨慎。私钥丢失后 state 和 Secret 都无法恢复，备份时必须同时备份私钥。
 3. **每条 `mgcl run -- ...` 都是临时服务**：在同一个项目目录、用同一个 `mgcl.db`，state 和 Secret 就连续。自动生成的用户 token 和 provider token 都只在本次 run 存活期间有效。
-4. **mgcl 只做 state 存储和 bootstrap Secret**：provider 只提供 bootstrap Secret，不导出 outputs；也没有远程 runs、variables、策略、团队权限等协作功能。provider 尚未发布 Registry 时用 `dev_overrides`。
+4. **mgcl 只做 state 存储和 bootstrap Secret**：Secret 中的每个 KV 默认 ephemeral，`set --public` 只把目标 KV 交给 public provider function；`public` 不表示明文。provider 只提供 bootstrap Secret 和读取 public KV 的 function，不定义远端 workspace 的 outputs；也没有远程 runs、variables、策略、团队权限等协作功能。provider 尚未发布 Registry 时用 `dev_overrides`。
 
 ## 补充：如果用的是 remote backend
 

@@ -1,6 +1,6 @@
 // Package providerapi is the stdlib-only client contract for the MgCl
-// ephemeral provider. It deliberately has no dependency on mgcl internals so
-// the independently versioned terraform-provider-mgcl repository can import it.
+// provider. It deliberately has no dependency on mgcl internals so the
+// independently versioned terraform-provider-mgcl repository can import it.
 package providerapi
 
 import (
@@ -20,8 +20,20 @@ const (
 	EnvEndpoint = "MGCL_PROVIDER_ENDPOINT"
 	// EnvToken is the environment variable carrying the provider session token.
 	EnvToken = "MGCL_PROVIDER_TOKEN"
-	// SecretsReadPath is the only provider API route.
+	// SecretsReadPath reads the KVs of one Secret.
 	SecretsReadPath = "/api/mgcl/v1/secrets:read"
+	// SecretKVsWritePath creates or overwrites one KV.
+	SecretKVsWritePath = "/api/mgcl/v1/secret-kvs:write"
+	// SecretKVsDeletePath deletes one KV.
+	SecretKVsDeletePath = "/api/mgcl/v1/secret-kvs:delete"
+
+	// SecretAccessEphemeral requests every KV of a Secret, including public
+	// and ephemeral KVs. It is also the default when ReadSecretRequest.Access
+	// is empty.
+	SecretAccessEphemeral = "ephemeral"
+	// SecretAccessPublic requests only the KVs marked public
+	// (is_ephemeral = 0).
+	SecretAccessPublic = "public"
 
 	defaultTimeout   = 10 * time.Second
 	maxResponseBytes = 2 << 20
@@ -29,13 +41,47 @@ const (
 
 // ReadSecretRequest is the request body for SecretsReadPath.
 type ReadSecretRequest struct {
-	Name string `json:"name"`
+	Name   string `json:"name"`
+	Access string `json:"access,omitempty"`
 }
 
 // ReadSecretResponse is the successful response body for SecretsReadPath.
+// EphemeralMarks maps each returned KV key to its is_ephemeral mark. A true
+// value means the KV is ephemeral; false means it is public.
 type ReadSecretResponse struct {
-	Name   string            `json:"name"`
-	Values map[string]string `json:"values"`
+	Name           string            `json:"name"`
+	Values         map[string]string `json:"values"`
+	EphemeralMarks map[string]bool   `json:"ephemeral_marks"`
+}
+
+// WriteSecretKVRequest is the request body for SecretKVsWritePath.
+// IsEphemeral is a pointer so an omitted field is distinguishable from an
+// explicit false. The server treats a missing field as true (ephemeral), never
+// as public.
+type WriteSecretKVRequest struct {
+	Key         string `json:"key"`
+	Value       string `json:"value"`
+	IsEphemeral *bool  `json:"is_ephemeral,omitempty"`
+}
+
+// WriteSecretKVResponse is the successful response body for
+// SecretKVsWritePath. It never contains the value.
+type WriteSecretKVResponse struct {
+	Name        string `json:"name"`
+	Key         string `json:"key"`
+	IsEphemeral bool   `json:"is_ephemeral"`
+}
+
+// DeleteSecretKVRequest is the request body for SecretKVsDeletePath.
+type DeleteSecretKVRequest struct {
+	Key string `json:"key"`
+}
+
+// DeleteSecretKVResponse is the successful response body for
+// SecretKVsDeletePath.
+type DeleteSecretKVResponse struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
 }
 
 // Client is a minimal provider API client. Token and secret values are never
@@ -46,29 +92,81 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
-// ReadSecret fetches the current values of one secret. The default HTTP client
-// has a finite timeout and never follows redirects, so the token cannot be
-// forwarded to another host.
+// ReadSecret fetches every KV of one Secret. It sends access "ephemeral",
+// which returns public and ephemeral KVs together with their marks. The
+// default HTTP client has a finite timeout and never follows redirects, so the
+// token cannot be forwarded to another host.
 func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretResponse, error) {
+	return c.readSecret(ctx, name, SecretAccessEphemeral)
+}
+
+// ReadPublicSecret fetches only the public KVs of one Secret. It sends access
+// "public"; a Secret with no public KVs returns empty maps.
+func (c *Client) ReadPublicSecret(ctx context.Context, name string) (*ReadSecretResponse, error) {
+	return c.readSecret(ctx, name, SecretAccessPublic)
+}
+
+// WriteSecretKV creates or overwrites one KV. A missing Secret is created
+// atomically together with its DEK. isEphemeral sets the KV's access mark.
+func (c *Client) WriteSecretKV(ctx context.Context, ref, value string, isEphemeral bool) (*WriteSecretKVResponse, error) {
+	var out WriteSecretKVResponse
+	err := c.post(ctx, SecretKVsWritePath, WriteSecretKVRequest{
+		Key:         ref,
+		Value:       value,
+		IsEphemeral: &isEphemeral,
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteSecretKV deletes one KV. Deleting a missing Secret or KV succeeds and
+// never creates a Secret.
+func (c *Client) DeleteSecretKV(ctx context.Context, ref string) (*DeleteSecretKVResponse, error) {
+	var out DeleteSecretKVResponse
+	err := c.post(ctx, SecretKVsDeletePath, DeleteSecretKVRequest{Key: ref}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) readSecret(ctx context.Context, name, access string) (*ReadSecretResponse, error) {
+	var out ReadSecretResponse
+	err := c.post(ctx, SecretsReadPath, ReadSecretRequest{Name: name, Access: access}, &out)
+	if err != nil {
+		return nil, err
+	}
+	if out.Values == nil {
+		out.Values = map[string]string{}
+	}
+	if out.EphemeralMarks == nil {
+		out.EphemeralMarks = map[string]bool{}
+	}
+	return &out, nil
+}
+
+func (c *Client) post(ctx context.Context, path string, in, out any) error {
 	if c == nil {
-		return nil, errors.New("provider API client is nil")
+		return errors.New("provider API client is nil")
 	}
 	if c.Endpoint == "" {
-		return nil, errors.New("provider endpoint is not configured")
+		return errors.New("provider endpoint is not configured")
 	}
 	if c.Token == "" {
-		return nil, errors.New("provider token is not configured")
+		return errors.New("provider token is not configured")
 	}
 
-	body, err := json.Marshal(ReadSecretRequest{Name: name})
+	body, err := json.Marshal(in)
 	if err != nil {
-		return nil, fmt.Errorf("encode provider request: %w", err)
+		return fmt.Errorf("encode provider request: %w", err)
 	}
 
-	url := strings.TrimRight(c.Endpoint, "/") + SecretsReadPath
+	url := strings.TrimRight(c.Endpoint, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create provider request: %w", err)
+		return fmt.Errorf("create provider request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
@@ -77,7 +175,7 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
 	client := c.httpClient()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("provider request failed: %w", err)
+		return fmt.Errorf("provider request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -85,26 +183,22 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
 		// Use only the numeric status. resp.Status includes the server-supplied
 		// reason phrase, which an untrusted endpoint could fill with the bearer
 		// token or secret values. Never include the response body either.
-		return nil, fmt.Errorf("provider API returned status %d", resp.StatusCode)
+		return fmt.Errorf("provider API returned status %d", resp.StatusCode)
 	}
 
 	limited := io.LimitReader(resp.Body, maxResponseBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("read provider response: %w", err)
+		return fmt.Errorf("read provider response: %w", err)
 	}
 	if len(data) > maxResponseBytes {
-		return nil, errors.New("provider response exceeds size limit")
+		return errors.New("provider response exceeds size limit")
 	}
 
-	var out ReadSecretResponse
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, errors.New("provider response is not valid JSON")
+	if err := json.Unmarshal(data, out); err != nil {
+		return errors.New("provider response is not valid JSON")
 	}
-	if out.Values == nil {
-		out.Values = map[string]string{}
-	}
-	return &out, nil
+	return nil
 }
 
 func (c *Client) httpClient() *http.Client {

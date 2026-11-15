@@ -496,6 +496,122 @@ resource "terraform_data" "x" {
 	}
 }
 
+// localTofuVersion returns the version of the tofu on PATH, without the
+// leading "v".
+func localTofuVersion(t *testing.T) string {
+	t.Helper()
+	out := runTofu(t, t.TempDir(), baseEnv(), false, "version", "-json")
+	var v struct {
+		TerraformVersion string `json:"terraform_version"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("parse tofu version: %v\n%s", err, out)
+	}
+	if v.TerraformVersion == "" {
+		t.Fatalf("tofu version output has no terraform_version:\n%s", out)
+	}
+	return v.TerraformVersion
+}
+
+// TestE2ECloudInitAutoCreatesWorkspaceVersion covers the first-run flow: the
+// cloud block names a workspace that does not exist yet, so tofu init creates
+// it and PATCHes the local version. This is the path that used to print
+// "not available in the cloud backend" because mgcl had no PATCH endpoint.
+func TestE2ECloudInitAutoCreatesWorkspaceVersion(t *testing.T) {
+	requireTofu(t)
+
+	workdir := t.TempDir()
+	dbPath := filepath.Join(workdir, "mgcl.db")
+	identityPath := writeTestIdentity(t)
+
+	store, err := tacos.Open(dbPath, loadTestIdentity(t, identityPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	serverURL, cleanup := newRouterServer(t, store, "test-token")
+	t.Cleanup(cleanup)
+	hostPort := strings.TrimPrefix(serverURL, "http://")
+
+	org := "e2e-cloud-init-org"
+	wsName := "e2e-cloud-init-" + time.Now().Format("20060102150405")
+
+	// Deliberately no createWorkspaceViaAPI: init must create the workspace.
+	cliCfg := writeCLIConfig(t, workdir, hostPort, "test-token")
+
+	tfContent := fmt.Sprintf(`
+terraform {
+  cloud {
+    organization = %q
+    workspaces {
+      name = %q
+    }
+  }
+}
+
+resource "terraform_data" "x" {
+  input = "v1"
+}
+`, org, wsName)
+	if err := os.WriteFile(filepath.Join(workdir, "main.tf"), []byte(tfContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// No TF_WORKSPACE: selecting an existing workspace by environment variable
+	// disables auto-creation. The name in the cloud block is the first-run path.
+	env := baseEnv(
+		"TF_CLI_CONFIG_FILE="+cliCfg,
+		"TF_CLOUD_HOSTNAME="+hostPort,
+	)
+
+	wantVersion := localTofuVersion(t)
+
+	initOut := runTofu(t, workdir, env, false, "init", "-input=false")
+	if strings.Contains(initOut, "not available in the cloud backend") {
+		t.Fatalf("init warned that the local version is unavailable:\n%s", initOut)
+	}
+
+	// The PATCH must be persisted, not just echoed back.
+	ws, err := store.GetWorkspace(org, wsName)
+	if err != nil {
+		t.Fatalf("get workspace after init: %v", err)
+	}
+	if ws.TerraformVersion != wantVersion {
+		t.Fatalf("stored terraform-version = %q, want %q", ws.TerraformVersion, wantVersion)
+	}
+
+	resp := apiDo(t, "GET", serverURL+"/api/v2/organizations/"+org+"/workspaces/"+wsName,
+		"test-token", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get workspace API: status %d", resp.StatusCode)
+	}
+	var got struct {
+		Data struct {
+			Attributes struct {
+				TerraformVersion string `json:"terraform-version"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode workspace API response: %v", err)
+	}
+	if got.Data.Attributes.TerraformVersion != wantVersion {
+		t.Fatalf("API terraform-version = %q, want %q", got.Data.Attributes.TerraformVersion, wantVersion)
+	}
+
+	// The state path keeps working after init created the workspace.
+	out := runTofu(t, workdir, env, false, "apply", "-auto-approve", "-input=false")
+	if !strings.Contains(out, "Apply complete") {
+		t.Fatalf("expected 'Apply complete' in output:\n%s", out)
+	}
+	out = runTofu(t, workdir, env, false, "state", "list")
+	if !strings.Contains(out, "terraform_data.x") {
+		t.Fatalf("expected 'terraform_data.x' in state list:\n%s", out)
+	}
+}
+
 func TestE2ERunCommand(t *testing.T) {
 	requireTofu(t)
 
@@ -549,6 +665,9 @@ resource "terraform_data" "x" {
 	}
 	if !strings.Contains(out, "Apply complete") {
 		t.Fatalf("expected 'Apply complete' in output:\n%s", out)
+	}
+	if strings.Contains(out, "not available in the cloud backend") {
+		t.Fatalf("mgcl run warned that the local version is unavailable:\n%s", out)
 	}
 }
 

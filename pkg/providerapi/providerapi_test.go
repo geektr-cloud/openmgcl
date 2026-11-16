@@ -127,6 +127,71 @@ func TestClientDeleteSecretKV(t *testing.T) {
 	}
 }
 
+func TestClientWriteSecretKVs(t *testing.T) {
+	var gotPath, gotAuth, gotCacheControl string
+	var gotBody WriteSecretKVsRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotCacheControl = r.Header.Get("Cache-Control")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"aws-1/cn/scarborough","kvs":[{"key":"region","is_ephemeral":false},{"key":"token","is_ephemeral":true}]}`)
+	}))
+	defer ts.Close()
+
+	public := false
+	client := &Client{Endpoint: ts.URL, Token: "provider-token"}
+	out, err := client.WriteSecretKVs(context.Background(), "aws-1/cn/scarborough", []SecretKVWriteItem{
+		{Key: "region", Value: "us-east-1", IsEphemeral: &public},
+		{Key: "token", Value: "secret-value"},
+	}, []string{"old"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != SecretKVsWriteBatchPath {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if gotAuth != "Bearer provider-token" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if gotCacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q", gotCacheControl)
+	}
+	if gotBody.Name != "aws-1/cn/scarborough" || !gotBody.Ensure || len(gotBody.KVs) != 2 || len(gotBody.DeleteKeys) != 1 || gotBody.DeleteKeys[0] != "old" {
+		t.Fatalf("request = %+v", gotBody)
+	}
+	if gotBody.KVs[0].IsEphemeral == nil || *gotBody.KVs[0].IsEphemeral {
+		t.Fatalf("explicit false was not sent: %+v", gotBody.KVs[0])
+	}
+	if gotBody.KVs[1].IsEphemeral != nil {
+		t.Fatalf("omitted mark was not omitted: %+v", gotBody.KVs[1])
+	}
+	if out.Name != "aws-1/cn/scarborough" || len(out.KVs) != 2 || out.KVs[0].Key != "region" || out.KVs[0].IsEphemeral {
+		t.Fatalf("response = %+v", out)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", out), "secret-value") {
+		t.Fatalf("client response contains a value: %+v", out)
+	}
+
+	// A success response without kvs normalizes to an empty slice.
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"name":"empty"}`)
+	}))
+	defer ts2.Close()
+	emptyClient := &Client{Endpoint: ts2.URL, Token: "provider-token"}
+	empty, err := emptyClient.WriteSecretKVs(context.Background(), "empty", nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.KVs == nil || len(empty.KVs) != 0 {
+		t.Fatalf("empty response kvs = %#v", empty.KVs)
+	}
+}
+
 func TestClientReadPublicSecret(t *testing.T) {
 	var gotBody ReadSecretRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -18,6 +19,9 @@ import (
 )
 
 const (
+	// MaxSecretNameBytes is the maximum length of a full Secret name, including
+	// its separating slashes.
+	MaxSecretNameBytes = 64
 	// MaxSecretValueBytes is the maximum UTF-8 size of one KV value.
 	MaxSecretValueBytes = 64 << 10
 	// MaxSecretKVs is the maximum number of KV entries in one Secret.
@@ -44,6 +48,9 @@ var (
 	ErrSecretCorrupt = errors.New("secret data is corrupt")
 	// ErrSecretInvalidValue reports non-UTF-8 or oversized input.
 	ErrSecretInvalidValue = errors.New("invalid secret value")
+	// ErrSecretInvalidBatch reports duplicate, overlapping, or structurally
+	// invalid bulk KV input.
+	ErrSecretInvalidBatch = errors.New("invalid secret batch")
 	// ErrSecretLimitExceeded reports a KV count or total-size limit.
 	ErrSecretLimitExceeded = errors.New("secret limit exceeded")
 	// ErrSecretSchemaOutdated reports a database created before
@@ -52,7 +59,7 @@ var (
 	ErrSecretSchemaOutdated = errors.New("secret database schema is outdated: secret_kvs.is_ephemeral is missing; run mgcl-migrate to migrate this database")
 )
 
-var secretNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+var secretNameSegmentPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // SecretSummary is the plaintext metadata returned by ListSecrets.
 type SecretSummary struct {
@@ -80,6 +87,21 @@ type SecretDetails struct {
 	Keys      []SecretKeyMetadata
 }
 
+// SecretKVWrite is one upsert in a bulk write. IsEphemeral nil means true
+// (ephemeral), matching the fail-closed provider API default.
+type SecretKVWrite struct {
+	Key         string
+	Value       []byte
+	IsEphemeral *bool
+}
+
+// SecretKVWriteResult is the applied metadata of one bulk upsert. It never
+// contains a value.
+type SecretKVWriteResult struct {
+	Key         string
+	IsEphemeral bool
+}
+
 // SecretStore is an offline SQLite handle for the secret tables. A read-only
 // handle never migrates or creates the database and may omit the identity when
 // only metadata is read.
@@ -99,22 +121,40 @@ type SecretStore struct {
 	closeErr  error
 }
 
-// ValidSecretName reports whether name matches the v1 Secret/KV key syntax.
+// ValidSecretName reports whether name is a hierarchical Secret name. A name
+// is one or more slash-separated segments, each matching the v1 segment syntax,
+// with a total length of at most MaxSecretNameBytes.
 func ValidSecretName(name string) bool {
-	return secretNamePattern.MatchString(name)
+	if name == "" || len(name) > MaxSecretNameBytes {
+		return false
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if !secretNameSegmentPattern.MatchString(segment) {
+			return false
+		}
+	}
+	return true
 }
 
-// ParseSecretReference splits a strict <secret-name>/<key> reference. Exactly
-// one slash is required; both parts must satisfy ValidSecretName.
+// ValidSecretKey reports whether key is a single KV key segment. Keys never
+// contain a slash, even when the owning Secret name does.
+func ValidSecretKey(key string) bool {
+	return secretNameSegmentPattern.MatchString(key)
+}
+
+// ParseSecretReference splits a <secret-name>/<key> reference at its last
+// slash. The name may contain multiple slash-separated segments; the key must
+// be a single segment.
 func ParseSecretReference(ref string) (name, key string, err error) {
-	if strings.Count(ref, "/") != 1 {
+	index := strings.LastIndex(ref, "/")
+	if index < 0 {
 		return "", "", errors.New("secret reference must be <secret-name>/<key>")
 	}
-	name, key, _ = strings.Cut(ref, "/")
+	name, key = ref[:index], ref[index+1:]
 	if !ValidSecretName(name) {
 		return "", "", fmt.Errorf("invalid secret name %q", name)
 	}
-	if !ValidSecretName(key) {
+	if !ValidSecretKey(key) {
 		return "", "", fmt.Errorf("invalid secret key %q", key)
 	}
 	return name, key, nil
@@ -421,7 +461,7 @@ func (s *SecretStore) SetSecretValueWithPublic(name, key string, value []byte, p
 	if !ValidSecretName(name) {
 		return fmt.Errorf("invalid secret name %q", name)
 	}
-	if !ValidSecretName(key) {
+	if !ValidSecretKey(key) {
 		return fmt.Errorf("invalid secret key %q", key)
 	}
 	if !utf8.Valid(value) {
@@ -508,7 +548,7 @@ func (s *SecretStore) SetSecretValueWithPublic(name, key string, value []byte, p
 
 // GetSecretValue decrypts and returns the raw UTF-8 value bytes.
 func (s *SecretStore) GetSecretValue(name, key string) ([]byte, error) {
-	if !ValidSecretName(name) || !ValidSecretName(key) {
+	if !ValidSecretName(name) || !ValidSecretKey(key) {
 		return nil, errors.New("invalid secret reference")
 	}
 	if s.identity == nil {
@@ -557,7 +597,7 @@ func (s *SecretStore) GetSecretValue(name, key string) ([]byte, error) {
 
 // UnsetSecretValue removes one KV after successfully unwrapping the Secret DEK.
 func (s *SecretStore) UnsetSecretValue(name, key string) error {
-	if !ValidSecretName(name) || !ValidSecretName(key) {
+	if !ValidSecretName(name) || !ValidSecretKey(key) {
 		return errors.New("invalid secret reference")
 	}
 	secretID, _, err := s.preflightSecret(name)
@@ -1078,6 +1118,229 @@ func (s *Store) DeleteSecretKVContext(ctx context.Context, ref string) (string, 
 		}
 	}
 	return name, key, nil
+}
+
+// WriteSecretKVsContext applies one atomic batch of KV upserts and idempotent
+// deletes to a hierarchical Secret name. A missing Secret is created with its
+// DEK when ensure is true or at least one KV is upserted; a pure delete against
+// a missing Secret succeeds without creating anything. KVs that are not named
+// in the batch are preserved.
+func (s *Store) WriteSecretKVsContext(ctx context.Context, name string, kvs []SecretKVWrite, deleteKeys []string, ensure bool) ([]SecretKVWriteResult, error) {
+	if !ValidSecretName(name) {
+		return nil, fmt.Errorf("%w: invalid secret name %q", ErrSecretInvalidBatch, name)
+	}
+	if len(kvs) > MaxSecretKVs {
+		return nil, fmt.Errorf("%w: a secret may contain at most %d keys", ErrSecretLimitExceeded, MaxSecretKVs)
+	}
+	if len(deleteKeys) > MaxSecretKVs {
+		return nil, fmt.Errorf("%w: a batch may delete at most %d keys", ErrSecretLimitExceeded, MaxSecretKVs)
+	}
+
+	upserted := make(map[string]struct{}, len(kvs))
+	upsertBytes := 0
+	for _, item := range kvs {
+		if !ValidSecretKey(item.Key) {
+			return nil, fmt.Errorf("%w: invalid secret key %q", ErrSecretInvalidBatch, item.Key)
+		}
+		if _, ok := upserted[item.Key]; ok {
+			return nil, fmt.Errorf("%w: duplicate secret key %q", ErrSecretInvalidBatch, item.Key)
+		}
+		upserted[item.Key] = struct{}{}
+		if !utf8.Valid(item.Value) {
+			return nil, fmt.Errorf("%w: value must be valid UTF-8", ErrSecretInvalidValue)
+		}
+		if len(item.Value) > MaxSecretValueBytes {
+			return nil, fmt.Errorf("%w: value exceeds %d bytes", ErrSecretInvalidValue, MaxSecretValueBytes)
+		}
+		upsertBytes += len(item.Value)
+	}
+	if upsertBytes > MaxSecretTotalBytes {
+		return nil, fmt.Errorf("%w: values exceed %d bytes", ErrSecretLimitExceeded, MaxSecretTotalBytes)
+	}
+
+	deleted := make(map[string]struct{}, len(deleteKeys))
+	for _, key := range deleteKeys {
+		if !ValidSecretKey(key) {
+			return nil, fmt.Errorf("%w: invalid secret key %q", ErrSecretInvalidBatch, key)
+		}
+		if _, ok := deleted[key]; ok {
+			return nil, fmt.Errorf("%w: duplicate delete key %q", ErrSecretInvalidBatch, key)
+		}
+		if _, ok := upserted[key]; ok {
+			return nil, fmt.Errorf("%w: key %q is both upserted and deleted", ErrSecretInvalidBatch, key)
+		}
+		deleted[key] = struct{}{}
+	}
+
+	if err := requireSecretSchema(s.db); err != nil {
+		return nil, err
+	}
+
+	release, err := s.beginWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	now := nowISO()
+	changed := false
+	var secretID string
+	var dek []byte
+	err = tx.QueryRowContext(ctx, `SELECT id FROM secrets WHERE name = ?`, name).Scan(&secretID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if !ensure && len(kvs) == 0 {
+			// Pure delete or no-op against a missing Secret: success without
+			// creating a Secret or DEK.
+			return []SecretKVWriteResult{}, nil
+		}
+		secretID, err = newSecretID()
+		if err != nil {
+			return nil, err
+		}
+		var record *wrappedSecretDEKRecord
+		dek, record, err = newWrappedSecretDEK(s.identity, secretID)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO secrets (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+			secretID, name, now, now,
+		); err != nil {
+			return nil, fmt.Errorf("create secret: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO secret_deks
+			(secret_id, dek_fingerprint, recipient_fingerprint, suite, ephemeral_public_key, hkdf_salt, nonce, wrapped_dek, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			secretID, record.DEKFingerprint, record.RecipientFingerprint, record.Suite,
+			record.EphemeralPublicKey, record.HKDFSalt, record.Nonce, record.WrappedDEK, now,
+		); err != nil {
+			return nil, fmt.Errorf("create secret key: %w", err)
+		}
+		changed = true
+	case err != nil:
+		return nil, err
+	default:
+		dek, err = unlockSecretDEKByIDTx(tx, s.identity, secretID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer clearBytes(dek)
+
+	existing := make(map[string]int)
+	rows, err := tx.QueryContext(ctx, `SELECT key, length(ciphertext) FROM secret_kvs WHERE secret_id = ?`, secretID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var key string
+		var ciphertextLen int64
+		if err := rows.Scan(&key, &ciphertextLen); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if ciphertextLen < aeadOverhead {
+			rows.Close()
+			return nil, fmt.Errorf("%w: secret value envelope is too short", ErrSecretCorrupt)
+		}
+		existing[key] = int(ciphertextLen) - aeadOverhead
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	final := make(map[string]int, len(existing)+len(kvs))
+	for key, size := range existing {
+		final[key] = size
+	}
+	for key := range deleted {
+		delete(final, key)
+	}
+	for _, item := range kvs {
+		final[item.Key] = len(item.Value)
+	}
+	if len(final) > MaxSecretKVs {
+		return nil, fmt.Errorf("%w: a secret may contain at most %d keys", ErrSecretLimitExceeded, MaxSecretKVs)
+	}
+	total := 0
+	for _, size := range final {
+		total += size
+	}
+	if total > MaxSecretTotalBytes {
+		return nil, fmt.Errorf("%w: values exceed %d bytes", ErrSecretLimitExceeded, MaxSecretTotalBytes)
+	}
+
+	for _, key := range deleteKeys {
+		res, err := tx.ExecContext(ctx, `DELETE FROM secret_kvs WHERE secret_id = ? AND key = ?`, secretID, key)
+		if err != nil {
+			return nil, fmt.Errorf("delete secret value: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			changed = true
+		}
+	}
+
+	results := make([]SecretKVWriteResult, 0, len(kvs))
+	for _, item := range kvs {
+		mark := 1
+		if item.IsEphemeral != nil && !*item.IsEphemeral {
+			mark = 0
+		}
+		nonce, ciphertext, err := sealSecretValue(dek, secretID, item.Key, item.Value)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := existing[item.Key]; ok {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE secret_kvs SET suite = ?, nonce = ?, ciphertext = ?, is_ephemeral = ?, updated_at = ?
+				WHERE secret_id = ? AND key = ?`,
+				cryptSuite, nonce, ciphertext, mark, now, secretID, item.Key,
+			); err != nil {
+				return nil, fmt.Errorf("update secret value: %w", err)
+			}
+		} else {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO secret_kvs (secret_id, key, suite, nonce, ciphertext, is_ephemeral, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				secretID, item.Key, cryptSuite, nonce, ciphertext, mark, now, now,
+			); err != nil {
+				return nil, fmt.Errorf("insert secret value: %w", err)
+			}
+		}
+		results = append(results, SecretKVWriteResult{Key: item.Key, IsEphemeral: mark == 1})
+		changed = true
+	}
+
+	if changed {
+		if _, err := tx.ExecContext(ctx, `UPDATE secrets SET updated_at = ? WHERE id = ?`, now, secretID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if changed {
+		if err := s.markDirty(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Key < results[j].Key })
+	return results, nil
 }
 
 // newSecretID returns a random UUID v4.

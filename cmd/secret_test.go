@@ -475,6 +475,54 @@ func TestSecretCLIEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSecretCLIHierarchicalNames(t *testing.T) {
+	h := newSecretCLI(t)
+	stubNonTTY(t)
+	name := "aws-605592676484-cn/scarborough"
+
+	if _, stderr, err := runCLI(t, "", h.args("create", name)...); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(stderr, `Created secret "`+name+`"`) {
+		t.Fatalf("create stderr = %q", stderr)
+	}
+	if _, _, err := runCLI(t, "", h.args("set", name+"/region", "us-east-1")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "token-value", h.args("set", name+"/token", "--stdin")...); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCLI(t, "", h.args("get", name+"/region")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "us-east-1" {
+		t.Fatalf("get = %q", stdout)
+	}
+	stdout, _, err = runCLI(t, "", h.args("show", name, "-o", "json")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, `"name": "`+name+`"`) || !strings.Contains(stdout, `"key": "region"`) {
+		t.Fatalf("show = %s", stdout)
+	}
+	// Names with empty segments or a missing key are rejected before the
+	// existing Secret is touched.
+	for _, ref := range []string{name + "//key", name + "/"} {
+		if _, _, err := runCLI(t, "", h.args("set", ref, "value")...); err == nil {
+			t.Errorf("invalid reference %q was accepted", ref)
+		}
+	}
+	if _, _, err := runCLI(t, "", h.args("unset", name+"/region")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "", h.args("delete", name, "--yes")...); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCLI(t, "", h.args("show", name)...); err == nil {
+		t.Fatal("deleted Secret is still readable")
+	}
+}
+
 func TestSecretCLISetInputModes(t *testing.T) {
 	h := newSecretCLI(t)
 	stubNonTTY(t)

@@ -31,9 +31,11 @@ func newSecretCmd() *cobra.Command {
 		Short: "Manage bootstrap secrets in the local database",
 		Long: `Manage bootstrap secrets offline in the same mgcl.db used by mgcl run.
 
-Secret names and KV keys match ^[a-z0-9][a-z0-9_-]{0,63}$. A KV reference is
-<secret-name>/<key>. Values are always encrypted at rest with a per-Secret DEK,
-which is wrapped by the configured SSH Ed25519 recipient.
+A Secret name is one or more /-separated segments; each segment matches
+^[a-z0-9][a-z0-9_-]{0,63}$ and the full name is at most 64 bytes. KV keys are a
+single segment without /. A KV reference is <secret-name>/<key>, split at the
+last /. Values are always encrypted at rest with a per-Secret DEK, which is
+wrapped by the configured SSH Ed25519 recipient.
 
 New KVs are ephemeral (is_ephemeral = 1) and are returned to every mgcl_secret
 read. Use "secret set --public" to mark only that KV public (is_ephemeral = 0)

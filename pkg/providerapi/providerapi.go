@@ -26,6 +26,9 @@ const (
 	SecretKVsWritePath = "/api/mgcl/v1/secret-kvs:write"
 	// SecretKVsDeletePath deletes one KV.
 	SecretKVsDeletePath = "/api/mgcl/v1/secret-kvs:delete"
+	// SecretKVsWriteBatchPath atomically applies multiple KV upserts and
+	// idempotent deletes to one Secret.
+	SecretKVsWriteBatchPath = "/api/mgcl/v1/secret-kvs:write-batch"
 
 	// SecretAccessEphemeral requests every KV of a Secret, including public
 	// and ephemeral KVs. It is also the default when ReadSecretRequest.Access
@@ -84,6 +87,39 @@ type DeleteSecretKVResponse struct {
 	Key  string `json:"key"`
 }
 
+// SecretKVWriteItem is one upsert in a WriteSecretKVs request. IsEphemeral nil
+// means true (ephemeral); the server never defaults to public.
+type SecretKVWriteItem struct {
+	Key         string `json:"key"`
+	Value       string `json:"value"`
+	IsEphemeral *bool  `json:"is_ephemeral,omitempty"`
+}
+
+// WriteSecretKVsRequest is the request body for SecretKVsWriteBatchPath.
+// Ensure creates an otherwise empty Secret. A missing Secret is also created
+// when KVs is non-empty.
+type WriteSecretKVsRequest struct {
+	Name       string              `json:"name"`
+	Ensure     bool                `json:"ensure,omitempty"`
+	KVs        []SecretKVWriteItem `json:"kvs"`
+	DeleteKeys []string            `json:"delete_keys,omitempty"`
+}
+
+// SecretKVWriteMetadata is the applied metadata of one KV in a bulk response.
+// It never contains a value.
+type SecretKVWriteMetadata struct {
+	Key         string `json:"key"`
+	IsEphemeral bool   `json:"is_ephemeral"`
+}
+
+// WriteSecretKVsResponse is the successful response body for
+// SecretKVsWriteBatchPath. It contains only the Secret name and metadata for
+// the KVs upserted by this request.
+type WriteSecretKVsResponse struct {
+	Name string                  `json:"name"`
+	KVs  []SecretKVWriteMetadata `json:"kvs"`
+}
+
 // Client is a minimal provider API client. Token and secret values are never
 // included in returned errors.
 type Client struct {
@@ -128,6 +164,30 @@ func (c *Client) DeleteSecretKV(ctx context.Context, ref string) (*DeleteSecretK
 	err := c.post(ctx, SecretKVsDeletePath, DeleteSecretKVRequest{Key: ref}, &out)
 	if err != nil {
 		return nil, err
+	}
+	return &out, nil
+}
+
+// WriteSecretKVs atomically applies all upserts and idempotent deletes to one
+// Secret. When ensure is true, a missing Secret is created even with
+// no KVs. A missing Secret is also created when kvs is non-empty. The response
+// contains metadata only for the KVs upserted by this request.
+func (c *Client) WriteSecretKVs(ctx context.Context, name string, kvs []SecretKVWriteItem, deleteKeys []string, ensure bool) (*WriteSecretKVsResponse, error) {
+	if kvs == nil {
+		kvs = []SecretKVWriteItem{}
+	}
+	var out WriteSecretKVsResponse
+	err := c.post(ctx, SecretKVsWriteBatchPath, WriteSecretKVsRequest{
+		Name:       name,
+		Ensure:     ensure,
+		KVs:        kvs,
+		DeleteKeys: deleteKeys,
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	if out.KVs == nil {
+		out.KVs = []SecretKVWriteMetadata{}
 	}
 	return &out, nil
 }

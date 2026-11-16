@@ -77,11 +77,12 @@ mgcl secret delete bootstrap --yes --db ./mgcl.db
 
 约束：
 
-- Secret 名和 KV key 都匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，引用为 `<secret-name>/<key>`；
+- Secret name 由一个或多个 `/` 分隔的 segment 组成，每个 segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称（含 `/`）不超过 64 字节；KV key 仍是单个 segment，不能含 `/`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分；
 - value 必须是 UTF-8，单值最多 64 KiB，每个 Secret 最多 64 个 KV、合计最多 256 KiB；
 - 新建 KV 默认 `is_ephemeral = 1`；`set --public` 只把该 KV 转为 `0`，普通 `set` 保留已有 KV 的标记；CLI 没有反向 flag，但 provider 写 API 可以把标记改回 `true`；`create` 不接受 `--public`；
 - provider 读取 `access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV；没有 public KV 时返回空 map，不报 Secret 级 403；非 public KV 不会被选择或解密；
-- provider session 还能调用 `secret-kvs:write` / `secret-kvs:delete`，供 managed resource 原子创建或删除 KV；delete 幂等且保留空 Secret，不自动创建 Secret；
+- provider session 还能调用 `secret-kvs:write` / `secret-kvs:delete` / `secret-kvs:write-batch`，供 managed resource 原子创建、覆盖或删除 KV；delete 幂等且保留空 Secret，不自动创建 Secret；
+- `write-batch` 只拥有请求点名的 KV，未提及的 KV 保留；`ensure: true` 或非空 `kvs` 会在需要时创建 Secret，纯 delete 不会创建缺失的 Secret；整批 upsert 与 delete 在同一个事务中提交，任何失败全部回滚，但不承诺跨调用的顺序或幂等判断；
 - 只保留最新值，没有历史版本；`set` 覆盖，`unset`/`delete` 不做安全擦除；
 - `list`、`show` 只读明文元数据，不加载私钥，也不会创建缺失的数据库；
 - `create` 可以在缺失路径初始化数据库；`set`、`get`、`unset`、`delete` 不隐式建库；
@@ -195,7 +196,7 @@ MGCL_PROVIDER_ENDPOINT=http://127.0.0.1:<实际端口>
 MGCL_PROVIDER_TOKEN=<一次性随机 token>
 ```
 
-常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。撤销只影响后续请求：已经通过认证并开始的写/删可能继续完成；读取会在返回明文前再次校验 token。它只能调用 `POST /api/mgcl/v1/secrets:read`、`secret-kvs:write` 和 `secret-kvs:delete`；读取请求体用 `access: "ephemeral"` 或 `"public"` 选择范围，空 access 按 ephemeral 兼容旧 provider，`ephemeral` 返回全部 KV，`public` 只返回 public KV；不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 provider API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
+常驻 `mgcl run`（没有子进程）不签发 provider token。provider token 只存在内存，服务端只保存 SHA-256 摘要；子进程退出或服务关闭后立即失效。server 仍在监听时旧 token 返回 401；进程退出后端口关闭，客户端看到连接失败。撤销只影响后续请求：已经通过认证并开始的写/删可能继续完成；读取会在返回明文前再次校验 token。它只能调用 `POST /api/mgcl/v1/secrets:read`、`secret-kvs:write`、`secret-kvs:delete` 和 `secret-kvs:write-batch`；读取请求体用 `access: "ephemeral"` 或 `"public"` 选择范围，空 access 按 ephemeral 兼容旧 provider，`ephemeral` 返回全部 KV，`public` 只返回 public KV；不能访问 TACOS state、workspace、lock 或管理路由；用户 Bearer token 也不能调用 provider API。endpoint 从实际 listener 推导，不使用 `--server`。用户 TACOS token 与它完全独立：未配置时由每次 run 自动生成，子进程模式不打印，常驻模式启动后打印一次。
 
 provider 尚未发布到 OpenTofu Registry，需要 OpenTofu >=1.11。开发期在 provider 仓库构建 `terraform-provider-mgcl`，然后把 `dev_overrides` 写进 OpenTofu 的默认 CLI config `~/.tofurc`：
 
@@ -340,8 +341,9 @@ TACOS `state.v2` 子集与 provider Secret API：
 - `POST /api/mgcl/v1/secrets:read`（provider session token；`access: ephemeral|public`；`Cache-Control: no-store`）
 - `POST /api/mgcl/v1/secret-kvs:write`（provider session token；创建或覆盖 KV；`Cache-Control: no-store`）
 - `POST /api/mgcl/v1/secret-kvs:delete`（provider session token；幂等删除 KV；`Cache-Control: no-store`）
+- `POST /api/mgcl/v1/secret-kvs:write-batch`（provider session token；原子批量 upsert/delete；响应不含 value；`Cache-Control: no-store`）
 
-TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Authorization: Bearer <token>`；空 token 不表示免认证。子进程 `mgcl run --` 自动把当次 token 写入临时 CLI config，常驻 run 自动生成并打印一次，显式 `--token`/`MGCL_TOKEN`/YAML token 保持固定值。provider session token 只接受于上述三个 provider 路径，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 provider 路径。没有活跃 provider session 时这些端点一律 401。
+TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Authorization: Bearer <token>`；空 token 不表示免认证。子进程 `mgcl run --` 自动把当次 token 写入临时 CLI config，常驻 run 自动生成并打印一次，显式 `--token`/`MGCL_TOKEN`/YAML token 保持固定值。provider session token 只接受于上述四个 provider 路径，用于其他任何 TACOS 路由都返回 401；用户 token 也不能访问 provider 路径。没有活跃 provider session 时这些端点一律 401。
 
 ## 限制
 
@@ -359,9 +361,9 @@ TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Auth
 - 上传 raw state / JSON state 上限约 100MiB；含 base64 inline state 的 create 请求留有 base64 余量；workspace 和 lock 请求上限 1MiB；超限返回 413。
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
-- 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。
+- 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。Secret name 可含多个 `/` segment，完整名称不超过 64 字节；KV key 不含 `/`。
 - Secret 的访问标记属于每个 KV：新建 KV 默认 ephemeral；`set --public` 只把目标 KV 转为 public，普通 `set` 保留已有标记。public 只改变该 KV 的访问类别，不改变静态加密，也不意味着数据库中是明文。`access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV，没有匹配时返回空 map。
-- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期、限定路径的凭证，可读 Secret KV 并供 managed resource 调用 write/delete，不是 TACOS 用户 token，也不能执行其他 Secret 管理操作。
+- provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期、限定路径的凭证，可读 Secret KV 并供 managed resource 调用 write/delete/write-batch，不是 TACOS 用户 token，也不能执行其他 Secret 管理操作。
 - Secret 写入与 `mgcl run` 共用同一个 `mgcl.db` 和备份层；同一数据库不应同时运行多个写会话。备份不含明文 value，恢复仍只依赖 `mgcl.db` 和私钥。
 - 非 loopback provider endpoint 或 serverURL 需要显式确认。provider endpoint 是 HTTP；`--server` 的加密取决于其 scheme。
 - 一个进程只加载一把私钥；无法解锁的 lineage 在 state 读写时返回 403，其他 lineage 不受影响。

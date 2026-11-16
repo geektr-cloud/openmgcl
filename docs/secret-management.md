@@ -31,11 +31,12 @@ Secret 与 state 复用同一个项目 `mgcl.db`、同一把 SSH Ed25519 Recipie
 
 | 概念 | 约束 |
 |---|---|
-| Secret | 不可变 `secret_id`，唯一且可读的 `name`；一个 Secret 对应一把 Secret DEK；不含 Secret 级访问标记 |
+| Secret | 不可变 `secret_id`，唯一且可读的层级 `name`；一个 Secret 对应一把 Secret DEK；不含 Secret 级访问标记 |
+| Secret name | 一个或多个 `/` 分隔的 segment；每段匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`；完整名称（含 `/`）不超过 64 字节 |
 | KV access mark | 每个 KV 的 `is_ephemeral` 为 1（ephemeral，默认）或 0（public）；`access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 0 的 KV |
-| KV | `<secret-name>/<key>` 引用；每个 KV 有独立 nonce、ciphertext 与 `is_ephemeral`；只保留最新值 |
+| KV | 单段 key，不含 `/`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分；每个 KV 有独立 nonce、ciphertext 与 `is_ephemeral`；只保留最新值 |
 | Secret DEK | 32-byte 随机数据密钥；每 Secret 一把；只保存由当前 Recipient 公钥包裹后的形式 |
-| Provider session | `mgcl run -- <command>` 子进程使用的短期 token；只允许 Secret read/write/delete 固定路径 |
+| Provider session | `mgcl run -- <command>` 子进程使用的短期 token；只允许 Secret read/write/delete/write-batch 固定路径 |
 
 ## 3. 配置与启动
 
@@ -73,22 +74,27 @@ DB 与私钥的加载边界按命令区分：
 实现已按本节完成：`create`、`set`、`unset`、`delete` 复用 `internal/sqlitebackup`：
 
 - 四个写命令都是 **Write session**：按同一 `backup_to` / `--backup-to` 配置语义解析、校验目标，执行 `path:` probe 与 `sqlite:` 初始备份，成功提交后标记 dirty，退出前 drain/checkpoint/copy；任一目标失败时 fail-closed，命令非零退出，且不得声称备份成功。
-- `list`、`show`、`get` 是只读命令，不触发备份、不 probe、不创建备份目标；provider session 的 `secrets:read` 同样不触发备份。`secret-kvs:write` / `secret-kvs:delete` 会修改 Secret，提交后标记 dirty 并复用同一备份层；备份失败不得被当作成功。
+- `list`、`show`、`get` 是只读命令，不触发备份、不 probe、不创建备份目标；provider session 的 `secrets:read` 同样不触发备份。`secret-kvs:write` / `secret-kvs:delete` / `secret-kvs:write-batch` 会修改 Secret，提交后标记 dirty 并复用同一备份层；无实际变化的 batch 不必标记 dirty；备份失败不得被当作成功。
 - 备份内容仍是同一个已加密 `mgcl.db`，备份层不得为了 secret 解密数据、导出明文或改变 envelope；恢复仍只依赖 `mgcl.db` 与私钥。
 - 空 `backup_to` 保持现有行为；不得新增仅 secret 生效的旁路、默认目标或 `MGCL_BACKUP_TO`。
 - 同一 `mgcl.db` 同时只应有一个写会话；并发 `mgcl run` 与 secret 写命令不在首版协调范围内，`path:` checkpoint 会因其他活跃连接 fail-close。
 
 ### 3.2 名称、引用与值
 
-Secret 名称和 KV key 使用同一语法：
+Secret name 由一个或多个 `/` 分隔的 segment 组成：
 
 ```text
-^[a-z0-9][a-z0-9_-]{0,63}$
+segment = ^[a-z0-9][a-z0-9_-]{0,63}$
+name    = segment ("/" segment)*    // 完整名称（含 /）长度 <= 64 字节
 ```
 
-即 1 到 64 个 ASCII 小写字母、数字、`_` 或 `-`，首字符必须是字母或数字。名称和 key 均不能为空，不能包含 `/`、空白或其他字符；首版只接受小写形式。
+每个 segment 是 1 到 64 个 ASCII 小写字母、数字、`_` 或 `-`，首字符必须是字母或数字。名称不能为空；空 segment、`.` 和 `..` 都由 segment 规则拒绝。旧单段名称继续兼容，不需要 schema migration。例如 `aws-605592676484-cn/scarborough` 合法。
 
-KV 引用固定为 `<secret-name>/<key>`，按唯一一个 `/` 分割；因为名称和 key 都不允许 `/`，解析无歧义。出现零个或多个 `/` 时按用法错误拒绝。
+KV key 仍是单个 segment，语法与 segment 相同，永远不能包含 `/`。
+
+完整 KV 引用为 `<secret-name>/<key>`，按**最后一个** `/` 拆分：左侧完整地作为 Secret name 校验，右侧作为单段 KV key 校验。不要按第一个 `/` 拆分，否则层级名称会被错误截断。没有 `/`、左侧为空（含 `//` 等空 segment）或右侧为空时按用法错误拒绝。function wildcard 同样以最后一个 `/` 切分。
+
+因为名称和引用都是 `<a>/<b>` 同形，`mgcl secret set a/b <value>` 始终表示 Secret `a` 的 key `b`；要写 Secret `a/b` 的 key，必须使用 `a/b/<key>`。读取、unset 同理。
 
 KV value 必须是合法 UTF-8 文本，允许空字符串、换行和任意 Unicode 标量值；不裁剪、不做 Unicode 规范化、不改变换行。单 value 最大 64 KiB（按 UTF-8 字节计）。每个 Secret 最多 64 个 KV，全部 value 合计最多 256 KiB。超出限制在写入前拒绝。
 
@@ -228,14 +234,15 @@ MGCL_PROVIDER_TOKEN=<opaque-token>
 
 provider token 只能：
 
-- 认证 `POST /api/mgcl/v1/secrets:read`、`POST /api/mgcl/v1/secret-kvs:write` 与 `POST /api/mgcl/v1/secret-kvs:delete`；
+- 认证 `POST /api/mgcl/v1/secrets:read`、`POST /api/mgcl/v1/secret-kvs:write`、`POST /api/mgcl/v1/secret-kvs:delete` 与 `POST /api/mgcl/v1/secret-kvs:write-batch`；
 - 以 `access: "ephemeral"`（或空值）读取该 Secret 的全部 KV 及 marks，或以 `access: "public"` 只读取 `is_ephemeral = 0` 的 KV；
-- 以 write 创建或覆盖 KV（必要时原子创建 Secret 和 DEK），以 delete 幂等删除 KV。
+- 以 write 创建或覆盖 KV（必要时原子创建 Secret 和 DEK），以 delete 幂等删除 KV；
+- 以 write-batch 原子批量 upsert/delete KV；batch 只拥有请求点名的 KV，`ensure: true` 或非空 `kvs` 可在需要时创建 Secret，delete 与 batch 都不会删除 Secret。
 
 provider token 不能：
 
 - 被 TACOS state、workspace、lock、discovery 或其他用户 API 接受；
-- 列出 Secret，或执行 write/delete 之外的 Secret 管理操作；
+- 列出 Secret，或执行 write/delete/write-batch 之外的 Secret 管理操作；
 - 读写 state，或执行任何管理操作；
 - 在子进程退出或 server shutdown 后继续使用。
 
@@ -243,7 +250,7 @@ TACOS API 始终要求用户 Bearer token，空 token 不绕过认证；provider
 
 `access` 不是 token 级权限：同一个 provider token 可以声明 `ephemeral` 或 `public`，服务端只按每个 KV 的 `is_ephemeral` 过滤。服务端无法识别请求来自 ephemeral resource、public function 还是 managed resource；访问隔离依赖 provider 各调用点使用正确的 client 方法，而不是 token 能力划分。public 读取不会选择或解密非 public KV，因此 public 响应不含这些 KV 的名称；404 仅表示 Secret 不存在，这是同一数据库信任域内接受的信息面。
 
-撤销后的表现分两种：server 仍在监听时，旧 token 的三个 Secret 端点都返回 401；进程退出后端口已关闭，客户端得到的是连接失败，而不是 HTTP 401。两者都表示 token 已失效，但测试和日志不应混为一谈。撤销只影响之后的请求：已经通过认证并开始的写/删可能继续完成，读取也会在返回明文前再次检查 token，已撤销的读取不会返回 values。
+撤销后的表现分两种：server 仍在监听时，旧 token 的所有 provider Secret 端点都返回 401；进程退出后端口已关闭，客户端得到的是连接失败，而不是 HTTP 401。两者都表示 token 已失效，但测试和日志不应混为一谈。撤销只影响之后的请求：已经通过认证并开始的写/删可能继续完成，读取也会在返回明文前再次检查 token，已撤销的读取不会返回 values。
 
 ### 5.3 信任边界
 
@@ -330,19 +337,61 @@ Content-Type: application/json
 - write 复用 64 KiB 单值、64 KV、256 KiB 总量与 UTF-8 校验；覆盖已有 KV 时保留 `created_at` 并更新 `updated_at` 与标记；
 - delete 不需要解密；删除不存在的 Secret 或 KV 幂等成功，绝不自动创建 Secret，删除最后一个 KV 后保留空 Secret；
 - write 请求体上限 512 KiB，以容纳合法 64 KiB value 的 JSON 转义膨胀；read 仍为 8 KiB；delete 沿用 8 KiB；
-- 三个端点都使用 `Cache-Control: no-store`，共享 provider token 认证、请求读取 deadline 和不记录秘密的规则；
+- 上述端点都使用 `Cache-Control: no-store`，共享 provider token 认证、请求读取 deadline 和不记录秘密的规则；
 - 不做 cache invalidation：同一 OpenTofu project 不要同时用 `mgcl_secret` 读、用 managed resource 写同一个 KV；mgcl 不承诺跨调用的幂等性判断或事务顺序确定性，managed resource 仍按上述 CRUD 语义执行。
 
-### 6.3 错误
+### 6.3 批量写入端点
+
+```http
+POST /api/mgcl/v1/secret-kvs:write-batch
+Authorization: Bearer <provider-token>
+Content-Type: application/json
+
+{
+  "name": "aws-605592676484-cn/scarborough",
+  "ensure": true,
+  "kvs": [
+    {"key": "region", "value": "us-east-1", "is_ephemeral": false}
+  ],
+  "delete_keys": ["old"]
+}
+```
+
+成功响应只含本次 upsert 的元数据，不含 value、ciphertext 或 DEK：
+
+```json
+{
+  "name": "aws-605592676484-cn/scarborough",
+  "kvs": [
+    {"key": "region", "is_ephemeral": false}
+  ]
+}
+```
+
+约束：
+
+- `name` 必填，必须是合法的层级 Secret name；`kvs` 最多 64 项，裸 key 唯一；`delete_keys` 最多 64 项，裸 key 唯一，且不得与 `kvs` 重叠；重复、重叠或超过数量上限返回 400；
+- 每个 `kvs[].key` 是单段裸 key，不能含 `/`；`value` 必须合法 UTF-8，单值不超过 64 KiB；`is_ephemeral` 缺省为 `true`（ephemeral），显式 `false` 才是 public；缺省绝不能变成 public。**即使覆盖已有 public KV，省略 `is_ephemeral` 也会把它重置为 ephemeral；要保留 public 必须显式传 `false`。**
+- Secret 缺失且 `ensure: true` 或 `kvs` 非空时，在同一事务中创建 Secret、独立 DEK 和全部 upsert；`ensure: false` 且只有 delete、Secret 缺失时幂等成功，不创建 Secret；`ensure: true` 且没有 KV 时创建空 Secret；
+- Secret 存在时，在同一个 `BEGIN IMMEDIATE` 事务中解锁 DEK、upsert 全部 `kvs`、幂等执行 `delete_keys`，并保留请求未提及的 KV；`ensure` 为真但 Secret 已存在时不重建；
+- 按**最终 KV 集合**校验 64 KV、256 KiB 总量与单值限制，即先应用 delete、再应用 upsert 后校验；因此“删一个、加一个”可以在满配额时成功，净增长则失败；更新 value 或 mark 与 delete 组合同样按最终状态计算；
+- 加密格式、`created_at`（已有 KV 保留）与 `updated_at` 语义与单 KV 写一致；所有成功变更更新 Secret `updated_at`，提交后 mark dirty；无实际变化不要求 dirty；
+- 整批 upsert 与 delete 必须原子提交，任何校验、加密、事务或 quota 失败都整体回滚，不能部分写；
+- 响应 200 只包含 `name` 和本次 upsert 的 `kvs:[{key,is_ephemeral}]`，可固定按 key 排序；绝不返回 value、ciphertext、DEK 或 wrapped key；
+- 请求体上限 2 MiB；read 与单 KV write/delete 的既有上限不变；
+- batch 只拥有本次点名的 KV；ensure/delete/batch 都不删除 Secret；不承诺跨调用的顺序、幂等性判断或读后写一致性；
+- 与其它 provider 写入一样，wrong recipient 返回 403；不记录请求/响应体、token 或 value。
+
+### 6.4 错误
 
 | 状态 | 场景 | 响应 |
 |---|---|---|
-| 400 | JSON 非法、name/key 引用非法、access 非法、value 非 UTF-8 或超限、KV 数量/总量超限 | 简短错误，不回显 value/token；超限为 `{"error":"secret limit exceeded"}` |
+| 400 | JSON 非法、name/key 引用非法、access 非法、batch 重复/重叠、value 非 UTF-8 或超限、KV 数量/总量超限 | 简短错误，不回显 value/token；超限为 `{"error":"secret limit exceeded"}` |
 | 401 | token 缺失、格式错误或已失效 | 简短错误 |
 | 403 | 当前 Recipient 无法解开目标 Secret 的 DEK | 固定 `{"error":"secret key access denied"}` |
 | 404 | 读取的 Secret 不存在 | 简短错误 |
 | 405 | 非 POST | 简短错误 |
-| 413 | 请求体超过限制 | 简短错误 |
+| 413 | 请求体超过限制（batch 为 2 MiB） | 简短错误 |
 | 429 | 可选限流 | 首版可不启用 |
 | 500 | 解密失败、envelope 损坏、数据库错误 | 通用错误，不返回明文或密钥材料 |
 
@@ -489,6 +538,7 @@ AAD 也不认证 `is_ephemeral`。访问标记是数据库明文元数据，能�
 - `set`：按名称读取 Secret 和 DEK；解锁并验证 Recipient；加密；插入或覆盖 `secret_kvs`；更新 `secrets.updated_at`；`--public` 时在同一事务中把目标 `secret_kvs.is_ephemeral` 置 0，不带 `--public` 时已有 KV 保留标记、新 KV 默认 1；提交。Recipient 不匹配、解锁失败或任何写入失败时 KV 与标记都不改变。Secret 不存在时失败，不自动创建。并发覆盖同一 key 时后提交者获胜，不保留历史。
 - provider `secret-kvs:write`：在单个 `BEGIN IMMEDIATE` 事务中按 name 查 Secret；不存在则生成 UUID、独立 DEK、wrapped key 并插入 `secrets` 与 `secret_deks`；解锁 DEK；校验引用与 value；插入或覆盖目标 KV 并设置 `is_ephemeral`；更新 `secrets.updated_at`；提交后再 mark dirty。Secret、DEK 与 KV 必须原子提交，任何一步失败都不留下空 Secret 或孤儿行。写 gate 与 `MaxOpenConns(1)` 保证并发写同一新 Secret 的不同 key 时只有一个事务创建 Secret 和 DEK，其余事务看到已提交的行后只 upsert 自己的 KV。
 - provider `secret-kvs:delete`：不需要解锁 DEK；在单个事务中按 name 查 Secret，查找目标 KV 并删除；删除不存在的 Secret 或 KV 是幂等成功，不自动创建 Secret；删除最后一个 KV 后保留空 Secret。只有实际删除行时才更新 `secrets.updated_at` 并 mark dirty。
+- provider `secret-kvs:write-batch`：在单个 `BEGIN IMMEDIATE` 事务中按层级 name 查 Secret；缺失时仅在 `ensure = true` 或 `kvs` 非空时创建 Secret、DEK；纯 delete 缺失 Secret 直接幂等成功，不建库行。Secret 存在时必须解锁 DEK。随后按“现有 KV - delete_keys + kvs”计算最终集合并校验 64 KV/256 KiB/单值限制，执行幂等 delete 和全部 upsert，未提及 KV 不动。任何一步失败整体回滚；只有实际创建/更新/删除行时才更新 `secrets.updated_at`，提交后 mark dirty。响应只返回本次 upsert 的 key 与 mark。
 - `get`：在一致快照中读取 Secret、DEK 与 KV；解锁并验证 Recipient，再认证解密；不写库。行在读取前被删除时返回 not found，不能返回其他 Secret 的值。
 - `unset`：在进入写事务前读取并成功解锁目标 Secret 的 DEK，验证 Recipient；随后删除目标 KV 并更新 Secret `updated_at`。wrong recipient 直接失败，不执行删除。Secret 或 key 不存在时失败并回滚。
 - `delete`：在进入删除写事务前读取并成功解锁目标 Secret 的 DEK，验证 Recipient；随后删除 Secret，级联删除 DEK 与 KV。wrong recipient 直接失败，不执行删除。不存在时失败。
@@ -515,6 +565,9 @@ AAD 也不认证 `is_ephemeral`。访问标记是数据库明文元数据，能�
 | `set` 时 Secret 不存在 | 错误；不自动创建 |
 | provider write 时 Secret 不存在 | 自动原子创建 Secret、DEK 与 KV；失败时整体回滚 |
 | provider delete 的 Secret 或 KV 不存在 | 幂等成功；不创建 Secret |
+| provider batch 的 Secret 不存在且 `ensure` 为真或 `kvs` 非空 | 原子创建 Secret、DEK 与 upsert；失败时整体回滚 |
+| provider batch 的 Secret 不存在且为纯 delete | 幂等成功；不创建 Secret |
+| provider batch 出现重复/重叠 key 或最终配额超限 | 400；整批不写入 |
 | 当前 Recipient 与 wrapped DEK 不匹配 | key-access denied；不返回明文；`unset`/`delete`/provider write 不修改；provider read/write 返回 403 `secret key access denied` |
 | wrapped DEK 缺失、长度错误、fingerprint 不匹配 | 数据损坏/密钥错误；不回退 |
 | KV nonce 长度错误、ciphertext 过短、AEAD/AAD 失败 | 数据损坏；不返回明文；public 读取不触及非 public KV |
@@ -575,7 +628,7 @@ provider "aws" {
 独立 provider 仓库为 `github.com/geektr-cloud/terraform-provider-mgcl`，provider local name 为 `mgcl`。
 
 - 首版只在 `mgcl run -- <command>` 子进程中工作；常驻 `mgcl run` 不签发 provider token，因此不能使用 provider；
-- ephemeral resource `mgcl_secret` 使用 `access: "ephemeral"`，得到该 Secret 全部 KV 及 `ephemeral_marks`，因此能读取混合 Secret 里的 public 与 ephemeral KV；managed resource 使用 `SecretKVsWritePath`/`SecretKVsDeletePath` 维护自己的 KV；
+- ephemeral resource `mgcl_secret` 使用 `access: "ephemeral"`，得到该 Secret 全部 KV 及 `ephemeral_marks`，因此能读取混合 Secret 里的 public 与 ephemeral KV；managed resource 使用 `SecretKVsWritePath`/`SecretKVsDeletePath` 维护自己的 KV，需要一次原子更新多份 KV 时使用 `SecretKVsWriteBatchPath`；batch 只拥有请求点名的 KV，不删除 Secret，也不拥有未提及的 KV；
 - 若未来提供 public provider function，它必须使用 `access: "public"`，只拿到 `is_ephemeral = 0` 的 KV；没有 public KV 时返回空 map，不报 403；function 返回值可能进入 plan/state 或日志，所以只有用户显式 `set --public`（或 managed resource 以 `is_ephemeral: false` 写入）的 KV 才能用于该路径；public 不表示数据库明文；
 - `provider "mgcl" {}` 不需要必填参数；从 `MGCL_PROVIDER_ENDPOINT` 和 `MGCL_PROVIDER_TOKEN` 读取连接信息；Secret value 不来自环境；
 - provider `Configure` 不访问网络；缺少 endpoint/token 时允许 `tofu validate` 通过，由 Open 返回清晰错误；
@@ -596,11 +649,12 @@ provider "aws" {
 const (
     EnvEndpoint            = "MGCL_PROVIDER_ENDPOINT"
     EnvToken               = "MGCL_PROVIDER_TOKEN"
-    SecretsReadPath        = "/api/mgcl/v1/secrets:read"
-    SecretKVsWritePath     = "/api/mgcl/v1/secret-kvs:write"
-    SecretKVsDeletePath    = "/api/mgcl/v1/secret-kvs:delete"
-    SecretAccessEphemeral  = "ephemeral"
-    SecretAccessPublic     = "public"
+    SecretsReadPath         = "/api/mgcl/v1/secrets:read"
+    SecretKVsWritePath      = "/api/mgcl/v1/secret-kvs:write"
+    SecretKVsDeletePath     = "/api/mgcl/v1/secret-kvs:delete"
+    SecretKVsWriteBatchPath = "/api/mgcl/v1/secret-kvs:write-batch"
+    SecretAccessEphemeral   = "ephemeral"
+    SecretAccessPublic      = "public"
 )
 
 type ReadSecretRequest struct {
@@ -635,6 +689,29 @@ type DeleteSecretKVResponse struct {
     Key  string `json:"key"`
 }
 
+type SecretKVWriteItem struct {
+    Key         string `json:"key"`
+    Value       string `json:"value"`
+    IsEphemeral *bool  `json:"is_ephemeral,omitempty"`
+}
+
+type WriteSecretKVsRequest struct {
+    Name       string              `json:"name"`
+    Ensure     bool                `json:"ensure,omitempty"`
+    KVs        []SecretKVWriteItem `json:"kvs"`
+    DeleteKeys []string            `json:"delete_keys,omitempty"`
+}
+
+type SecretKVWriteMetadata struct {
+    Key         string `json:"key"`
+    IsEphemeral bool   `json:"is_ephemeral"`
+}
+
+type WriteSecretKVsResponse struct {
+    Name string                 `json:"name"`
+    KVs  []SecretKVWriteMetadata `json:"kvs"`
+}
+
 type Client struct {
     Endpoint   string
     Token      string
@@ -645,9 +722,10 @@ func (c *Client) ReadSecret(ctx context.Context, name string) (*ReadSecretRespon
 func (c *Client) ReadPublicSecret(ctx context.Context, name string) (*ReadSecretResponse, error)
 func (c *Client) WriteSecretKV(ctx context.Context, ref, value string, isEphemeral bool) (*WriteSecretKVResponse, error)
 func (c *Client) DeleteSecretKV(ctx context.Context, ref string) (*DeleteSecretKVResponse, error)
+func (c *Client) WriteSecretKVs(ctx context.Context, name string, kvs []SecretKVWriteItem, deleteKeys []string, ensure bool) (*WriteSecretKVsResponse, error)
 ```
 
-`ReadSecret` 发送 `access: "ephemeral"`，返回全部 KV 与 marks；`ReadPublicSecret` 发送 `access: "public"`，只返回 public KV（可能为空 map）。`WriteSecretKV` 与 `DeleteSecretKV` 的 `ref` 是 `<secret-name>/<key>`；write 自动创建缺失的 Secret/DEK，delete 幂等。`WriteSecretKVRequest.IsEphemeral` 用指针区分“未提供”和显式 `false`：服务端把 nil 当作 `true`（ephemeral），`Client.WriteSecretKV` 总是发送显式值。非 2xx 时客户端按数字状态码返回错误，不解析服务端自由文本。
+`ReadSecret` 发送 `access: "ephemeral"`，返回全部 KV 与 marks；`ReadPublicSecret` 发送 `access: "public"`，只返回 public KV（可能为空 map）。`WriteSecretKV` 与 `DeleteSecretKV` 的 `ref` 是 `<secret-name>/<key>`，按最后一个 `/` 拆分；write 自动创建缺失的 Secret/DEK，delete 幂等。`WriteSecretKVRequest.IsEphemeral` 用指针区分“未提供”和显式 `false`：服务端把 nil 当作 `true`（ephemeral），`Client.WriteSecretKV` 总是发送显式值。`WriteSecretKVs` 的 `name` 是完整层级 Secret name，`kvs` 使用裸 key；`ensure` 控制空 Secret 的创建，纯 delete 不会创建缺失的 Secret。批量响应只含 upsert 元数据，不含 value。非 2xx 时客户端按数字状态码返回错误，不解析服务端自由文本。
 
 最小 client 要求：
 
@@ -753,7 +831,7 @@ CLI 与存储：
 - provider write 在并发请求下只创建一个 Secret 和一把 DEK，所有 KV 可读；
 - provider delete 幂等且保留空 Secret，不自动创建缺失 Secret；
 - 删除/覆盖不产生历史行；备份恢复只依赖 db + 私钥；
-- secret 写命令实现后，`create`/`set`/`unset`/`delete` 与 provider write/delete 复用 [database-backup.md](database-backup.md) 的备份层；`list`/`show`/`get`/provider read 不触发备份；备份失败 fail-closed 且不声称成功；空 `backup_to` 不改变原行为。
+- secret 写命令实现后，`create`/`set`/`unset`/`delete` 与 provider write/delete/write-batch 复用 [database-backup.md](database-backup.md) 的备份层；`list`/`show`/`get`/provider read 不触发备份；batch 无实际变化不要求 dirty；备份失败 fail-closed 且不声称成功；空 `backup_to` 不改变原行为。
 
 Provider session 与 API：
 
@@ -762,6 +840,8 @@ Provider session 与 API：
 - 成功读取返回最新值与 `ephemeral_marks`；空 Secret 返回 `{}` 与 `{}`；未知 Secret 404；
 - `access` 空/`ephemeral` 返回全部 KV，不过滤标记；`public` 只返回 `is_ephemeral = 0` 的 KV；无匹配返回空 map，不做 Secret 级 403；坏 ephemeral 密文不影响 public 读取，但 all 读取失败；非法 access 返回 400；
 - write 自动创建 Secret/DEK/KV，更新 value 与 mark，空 value 合法，响应不含 value；请求省略 `is_ephemeral` 时按 `true`（ephemeral）处理；非法输入 400、超大 body 413、wrong recipient 403 `secret key access denied`、KV 数量/总量超限 400 `secret limit exceeded`；
+- write-batch 自动创建、`ensure` 空 Secret、纯 delete 不创建、保留未提及 KV、缺省 ephemeral、重复/重叠 400、最终配额按 delete+upsert 组合校验、原子回滚、响应不含 value、wrong recipient 403、body 2 MiB 上限和备份 dirty；
+- 层级 Secret name 与按最后一个 `/` 拆分的 KV 引用在 CLI、store、read/write/delete 和 function wildcard 合同中都通过；旧单段 name/ref 保持兼容；
 - delete 幂等、不创建 Secret、保留空 Secret；
 - 并发 HTTP write 同一新 Secret 的不同 key 只产生 1 个 Secret、1 把 DEK，全部 KV 可读；
 - 两个独立 Store 句柄并发写同一新 Secret 的不同 key，仍只产生 1 个 Secret、1 把 DEK，全部 KV 可读；验证跨 handle 的 `BEGIN IMMEDIATE` 与 busy timeout；
@@ -827,11 +907,12 @@ Provider session 与 API：
 
 已实现（主仓）：
 
-- 存储：`internal/tacos/secret_store.go`、`internal/tacos/secret_envelope.go`。schema 为 `secrets` / `secret_deks` / `secret_kvs`，与 TACOS state 共用 `mgcl.db`、SSH identity 和迁移，但 label/AAD/fingerprint 独立。访问标记位于 `secret_kvs.is_ephemeral`（默认 1）；写路径使用 `BEGIN IMMEDIATE`、唯一约束、外键级联和事务。provider write 在同一事务中原子创建 Secret、DEK 与 KV；delete 幂等并保留空 Secret。
+- 存储：`internal/tacos/secret_store.go`、`internal/tacos/secret_envelope.go`。schema 为 `secrets` / `secret_deks` / `secret_kvs`，与 TACOS state 共用 `mgcl.db`、SSH identity 和迁移，但 label/AAD/fingerprint 独立。访问标记位于 `secret_kvs.is_ephemeral`（默认 1）；写路径使用 `BEGIN IMMEDIATE`、唯一约束、外键级联和事务。provider write 在同一事务中原子创建 Secret、DEK 与 KV；delete 幂等并保留空 Secret；write-batch 在同一事务中按最终集合原子 upsert/delete 并保留未提及 KV。
 - CLI：`cmd/secret.go`、`cmd/secret_output.go`。`list/show/create/set/get/unset/delete`，固定 flag、配置优先级、TTY 无回显、`--stdin`、`set --public`（只标记目标 KV）、`--yes`、备份接入和缺失 DB 边界；`list` 不显示 Secret 级访问列，`show` 逐 KV 暴露 `is_ephemeral`。
-- Provider session：`internal/tacos/provider_session.go`、`internal/tacos/provider.go`。`POST /api/mgcl/v1/secrets:read`（`access` 支持 `ephemeral` / `public`，空值按 ephemeral；ephemeral 返回全部 KV，public 只选择并解密 `is_ephemeral = 0` 的 KV，并返回 `ephemeral_marks`），以及 `POST /api/mgcl/v1/secret-kvs:write` / `secret-kvs:delete`；8 KiB 读取限制、512 KiB 写入限制、`Cache-Control: no-store`、安全固定错误文本，token 只存 SHA-256 摘要；provider token 被 TACOS 路由拒绝，用户 token 不能调用 provider 路径。
+- Provider session：`internal/tacos/provider_session.go`、`internal/tacos/provider.go`。`POST /api/mgcl/v1/secrets:read`（`access` 支持 `ephemeral` / `public`，空值按 ephemeral；ephemeral 返回全部 KV，public 只选择并解密 `is_ephemeral = 0` 的 KV，并返回 `ephemeral_marks`），以及 `POST /api/mgcl/v1/secret-kvs:write` / `secret-kvs:delete` / `secret-kvs:write-batch`；batch 在单个 `BEGIN IMMEDIATE` 事务中原子 upsert/delete、按最终集合校验限额、只返回 upsert 元数据；8 KiB 读取限制、512 KiB 单 KV 写入限制、2 MiB batch 限制、`Cache-Control: no-store`、安全固定错误文本，token 只存 SHA-256 摘要；provider token 被 TACOS 路由拒绝，用户 token 不能调用 provider 路径。
+- Secret 名称支持层级形式：每个 `/` segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称不超过 64 字节；KV key 仍为单段，完整引用按最后一个 `/` 拆分。旧单段名称和引用保持兼容，无 schema migration。
 - `mgcl run`：只对有子进程的运行签发 provider session，注入 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`，endpoint 从实际 listener 推导；用户 TACOS token 未配置时每次 run 自动生成，子进程模式只写入临时 CLI config，常驻模式在监听后打印一次；非 loopback 安全门在加载私钥、打开 DB、监听前执行。
-- 客户端：`pkg/providerapi`（stdlib-only、有限超时、不跟随重定向、2 MiB 响应上限、`ReadSecret` 发 ephemeral、`ReadPublicSecret` 发 public、`WriteSecretKV`、`DeleteSecretKV`）；`cmd/mgcl` 安装入口与根入口共用 `cmd.Main`。
+- 客户端：`pkg/providerapi`（stdlib-only、有限超时、不跟随重定向、2 MiB 响应上限、`ReadSecret` 发 ephemeral、`ReadPublicSecret` 发 public、`WriteSecretKV`、`DeleteSecretKV`、`WriteSecretKVs` 发 `secret-kvs:write-batch`）；`cmd/mgcl` 安装入口与根入口共用 `cmd.Main`。
 
 依赖外部仓库：
 

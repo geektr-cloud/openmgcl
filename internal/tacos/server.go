@@ -57,6 +57,7 @@ func buildRouter(s *Server) http.Handler {
 	r.HandleFunc(providerapi.SecretsReadPath, s.secretsReadHandler)
 	r.HandleFunc(providerapi.SecretKVsWritePath, s.secretKVsWriteHandler)
 	r.HandleFunc(providerapi.SecretKVsDeletePath, s.secretKVsDeleteHandler)
+	r.HandleFunc(providerapi.SecretKVsWriteBatchPath, s.secretKVsWriteBatchHandler)
 
 	// All API routes under /api/v2
 	r.Route("/api/v2", func(r chi.Router) {

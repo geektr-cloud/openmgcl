@@ -14,6 +14,7 @@ import (
 const (
 	maxProviderReadRequestBody  = 8 << 10
 	maxProviderWriteRequestBody = 512 << 10
+	maxProviderBatchRequestBody = 2 << 20
 	providerBodyReadTimeout     = 10 * time.Second
 )
 
@@ -149,6 +150,58 @@ func (s *Server) secretKVsDeleteHandler(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(providerapi.DeleteSecretKVResponse{Name: name, Key: key})
 }
 
+// secretKVsWriteBatchHandler atomically upserts and idempotently deletes KVs.
+// It never returns values. A missing Secret is created with its DEK when
+// ensure is true or when at least one KV is upserted; a pure delete is a
+// no-op success for a missing Secret.
+func (s *Server) secretKVsWriteBatchHandler(w http.ResponseWriter, r *http.Request) {
+	_, cleanup, ok := s.beginProviderRequest(w, r)
+	if !ok {
+		return
+	}
+	defer cleanup()
+	var req providerapi.WriteSecretKVsRequest
+	if !decodeProviderJSON(w, r, maxProviderBatchRequestBody, &req) {
+		return
+	}
+	if !ValidSecretName(req.Name) {
+		writeProviderError(w, http.StatusBadRequest, "invalid secret name")
+		return
+	}
+
+	kvs := make([]SecretKVWrite, 0, len(req.KVs))
+	for _, item := range req.KVs {
+		kvs = append(kvs, SecretKVWrite{
+			Key:         item.Key,
+			Value:       []byte(item.Value),
+			IsEphemeral: item.IsEphemeral,
+		})
+	}
+	results, err := s.store.WriteSecretKVsContext(r.Context(), req.Name, kvs, req.DeleteKeys, req.Ensure)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrSecretInvalidValue):
+			writeProviderError(w, http.StatusBadRequest, "invalid secret value")
+		case errors.Is(err, ErrSecretInvalidBatch):
+			writeProviderError(w, http.StatusBadRequest, "invalid request")
+		case errors.Is(err, ErrSecretLimitExceeded):
+			writeProviderError(w, http.StatusBadRequest, "secret limit exceeded")
+		case errors.Is(err, ErrSecretRecipientMismatch):
+			writeProviderError(w, http.StatusForbidden, "secret key access denied")
+		default:
+			writeProviderError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	out := make([]providerapi.SecretKVWriteMetadata, 0, len(results))
+	for _, item := range results {
+		out = append(out, providerapi.SecretKVWriteMetadata{Key: item.Key, IsEphemeral: item.IsEphemeral})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(providerapi.WriteSecretKVsResponse{Name: req.Name, KVs: out})
+}
+
 // beginProviderRequest applies the shared provider API guards: no-store
 // headers, POST-only, provider-session authorization and a bounded read
 // deadline. The returned cleanup resets the deadline.
@@ -248,7 +301,7 @@ func (s *Server) rejectProviderTokenMiddleware(next http.Handler) http.Handler {
 
 func isProviderPath(path string) bool {
 	switch path {
-	case providerapi.SecretsReadPath, providerapi.SecretKVsWritePath, providerapi.SecretKVsDeletePath:
+	case providerapi.SecretsReadPath, providerapi.SecretKVsWritePath, providerapi.SecretKVsDeletePath, providerapi.SecretKVsWriteBatchPath:
 		return true
 	default:
 		return false

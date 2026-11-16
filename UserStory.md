@@ -128,7 +128,7 @@ ls -A
 
 ## 5. 把 bootstrap 凭据交给 provider
 
-第一次用真实 provider apply 前需要的凭据（例如 AWS access key）也存进同一个 `mgcl.db`。`mgcl secret` 读同一份 `.mgcl.yaml`，不用再传其他参数：
+第一次用真实 provider apply 前需要的凭据（例如 AWS access key）也存进同一个 `mgcl.db`。`mgcl secret` 读同一份 `.mgcl.yaml`，不用再传其他参数。Secret name 可以由多个 `/` segment 组成，例如 `aws-605592676484-cn/scarborough`；每个 segment 仍匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称不超过 64 字节。KV key 仍是单段，完整引用按最后一个 `/` 拆分：
 
 ```bash
 mgcl secret create bootstrap
@@ -206,7 +206,7 @@ mgcl run -- tofu apply -auto-approve
 
 只有 `mgcl run -- <command>` 会签发 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`；常驻 `mgcl run` 不签发 provider token。TACOS 用户 token 两种模式都会自动生成：子进程模式只写进本次临时 CLI config、不打印，常驻模式在启动后打印一次。Secret 每次 plan/apply 由 provider 重新读取，所以更新 Secret 后下一条命令能读到新值。
 
-带写能力的 managed resource 通过同一 provider token 调用 `secret-kvs:write` / `secret-kvs:delete`。write 会自动创建缺失的 Secret 和 DEK，覆盖同一 KV 的值和标记；delete 幂等，删除最后一个 KV 后保留空 Secret，不会重建 Secret。mgcl 不做 cache invalidation，也不保证跨调用的幂等性判断或事务顺序：不要在同一个 OpenTofu project 里同时用 `mgcl_secret` 读、用 managed resource 写同一个 KV，否则读到旧值或相互覆盖都属预期。
+带写能力的 managed resource 通过同一 provider token 调用 `secret-kvs:write` / `secret-kvs:delete` / `secret-kvs:write-batch`。write 会自动创建缺失的 Secret 和 DEK，覆盖同一 KV 的值和标记；delete 幂等，删除最后一个 KV 后保留空 Secret，不会重建 Secret。`write-batch` 在一个事务里原子 upsert/delete 一批 KV，只拥有请求点名的 KV，未提及的 KV 保留；`ensure: true` 或非空 `kvs` 会在需要时创建 Secret，纯 delete 不会创建缺失的 Secret，也不会删除 Secret。mgcl 不做 cache invalidation，也不保证跨调用的幂等性判断或事务顺序：不要在同一个 OpenTofu project 里同时用 `mgcl_secret` 读、用 managed resource 写同一个 KV，否则读到旧值或相互覆盖都属预期。
 
 从 v0.1.0 升级的旧 `mgcl.db` 不会自动迁移：先在 `/tmp/mgcl-migrate` 目录构建，再运行 `/tmp/mgcl-migrate/mgcl-migrate ./mgcl.db`（或进入该目录运行 `./mgcl-migrate ./mgcl.db`）一次，之后再用本版本打开。迁移工具删除 `secrets.is_ephemeral`（若存在）并添加 `secret_kvs.is_ephemeral`，忽略旧列值。
 

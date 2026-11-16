@@ -99,6 +99,10 @@ workspace 级互斥锁，防止并发写 state；有 lock / unlock / force-unloc
 首次运行 OpenTofu 前需要准备的一组 bootstrap 凭据（例如 IAM access key、跨云凭据），以具名 KV 集合保存。访问可见性属于每个 KV，不属于 Secret 整体；Secret 本身只是 KV 的容器。它只覆盖 mgcl 接管的 bootstrap credentials，不接管 OpenTofu 创建的 state outputs。
 _Avoid_: state output, managed resource
 
+**Secret name**:
+Secret 的层级名称，由一个或多个 `/` 分隔的 segment 组成。每个 segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`；完整名称（含 `/`）不超过 64 字节。空 segment、`.` 和 `..` 都不是合法 segment；旧单段名称继续兼容。例如 `aws-605592676484-cn/scarborough`。
+_Avoid_: path, namespace
+
 **Ephemeral KV**:
 默认访问标记（`is_ephemeral = 1`）的 KV。完整读取（`access` 为空或 `ephemeral`）会返回它；`access: "public"` 不返回它。新建 KV 默认使用该标记。
 _Avoid_: private secret（易与静态加密混淆）
@@ -108,8 +112,12 @@ _Avoid_: private secret（易与静态加密混淆）
 _Avoid_: plaintext secret, unencrypted secret
 
 **KV**:
-Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。每个 KV 独立携带 `is_ephemeral` 访问标记。
+Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。每个 KV 独立携带 `is_ephemeral` 访问标记。KV key 永远是单个 segment，不含 `/`。
 _Avoid_: secret version, key-value file
+
+**KV reference**:
+`<secret-name>/<key>` 形式的寻址字符串，按最后一个 `/` 拆分：左侧是层级 Secret name，右侧是单段 key。不要按第一个 `/` 拆分。
+_Avoid_: secret path, full key
 
 **Secret DEK**:
 保护单个 Secret 全部 KV 的独立数据密钥。它与 State Lineage 的 Lineage Key 完全独立，绝不共用；首版每把 Secret DEK 只有一个 Recipient，且不轮换。

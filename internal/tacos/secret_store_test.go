@@ -149,7 +149,7 @@ func TestSecretCreateListShow(t *testing.T) {
 	if _, err := store.ShowSecret("missing"); !errors.Is(err, ErrSecretNotFound) {
 		t.Fatalf("missing show error = %v", err)
 	}
-	for _, name := range []string{"", "Bootstrap", "a/b", "a b", strings.Repeat("a", 65), "-bad", "_bad"} {
+	for _, name := range []string{"", "Bootstrap", "a//b", "a/../b", "a b", strings.Repeat("a", 65), "-bad", "_bad"} {
 		if _, err := store.CreateSecret(name); err == nil {
 			t.Errorf("invalid name %q was accepted", name)
 		}
@@ -743,7 +743,16 @@ func TestSecretLimits(t *testing.T) {
 }
 
 func TestParseSecretReference(t *testing.T) {
-	valid := []string{"a/b", "bootstrap/access_key_id", "0/0", "a_b/c-d"}
+	valid := []string{
+		"a/b",
+		"bootstrap/access_key_id",
+		"0/0",
+		"a_b/c-d",
+		"a/b/c",
+		"aws-605592676484-cn/scarborough/region",
+		"a-b/c_d/e-f/key",
+		strings.Repeat("a", 62) + "/b/c",
+	}
 	for _, ref := range valid {
 		name, key, err := ParseSecretReference(ref)
 		if err != nil {
@@ -754,16 +763,48 @@ func TestParseSecretReference(t *testing.T) {
 			t.Errorf("%q parsed as %q/%q", ref, name, key)
 		}
 	}
-	for _, ref := range []string{"", "a", "a/", "/b", "a/b/c", "A/b", "a/B", "a b/c", strings.Repeat("a", 65) + "/b"} {
+	invalid := []string{
+		"", "a", "a/", "/b", "a//b", "a/b/", "a/./b", "a/../b", ".",
+		"A/b", "a/B", "a b/c",
+		strings.Repeat("a", 65) + "/b",
+		strings.Repeat("a", 63) + "/b/c",
+		"a/" + strings.Repeat("b", 65),
+	}
+	for _, ref := range invalid {
 		if _, _, err := ParseSecretReference(ref); err == nil {
 			t.Errorf("invalid reference %q was accepted", ref)
 		}
 	}
-	if !ValidSecretName(strings.Repeat("a", 64)) {
-		t.Fatal("64-character name was rejected")
+
+	validNames := []string{
+		"a",
+		strings.Repeat("a", 64),
+		"a/b",
+		"aws-605592676484-cn/scarborough",
+		strings.Repeat("a", 62) + "/b",
 	}
-	if ValidSecretName(strings.Repeat("a", 65)) {
-		t.Fatal("65-character name was accepted")
+	for _, name := range validNames {
+		if !ValidSecretName(name) {
+			t.Errorf("valid name %q was rejected", name)
+		}
+	}
+	invalidNames := []string{
+		"", strings.Repeat("a", 65), "a//b", "/a", "a/", "a/./b", "a/../b", "a b/c", "A/b",
+		strings.Repeat("a", 63) + "/b",
+	}
+	for _, name := range invalidNames {
+		if ValidSecretName(name) {
+			t.Errorf("invalid name %q was accepted", name)
+		}
+	}
+	if ValidSecretKey("a/b") {
+		t.Fatal("KV key containing a slash was accepted")
+	}
+	if !ValidSecretKey(strings.Repeat("a", 64)) {
+		t.Fatal("64-character KV key was rejected")
+	}
+	if ValidSecretKey(strings.Repeat("a", 65)) {
+		t.Fatal("65-character KV key was accepted")
 	}
 }
 

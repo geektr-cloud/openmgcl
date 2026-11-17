@@ -32,9 +32,9 @@ Secret 与 state 复用同一个项目 `mgcl.db`、同一把 SSH Ed25519 Recipie
 | 概念 | 约束 |
 |---|---|
 | Secret | 不可变 `secret_id`，唯一且可读的层级 `name`；一个 Secret 对应一把 Secret DEK；不含 Secret 级访问标记 |
-| Secret name | 一个或多个 `/` 分隔的 segment；每段匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`；完整名称（含 `/`）不超过 64 字节 |
+| Secret name | 一个或多个 `/` 分隔的非空 segment；每段满足 `segment == url.PathEscape(segment)`；完整名称（含 `/`）不超过 64 字节 |
 | KV access mark | 每个 KV 的 `is_ephemeral` 为 1（ephemeral，默认）或 0（public）；`access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 0 的 KV |
-| KV | 单段 key，不含 `/`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分；每个 KV 有独立 nonce、ciphertext 与 `is_ephemeral`；只保留最新值 |
+| KV | 非空 key，最多 64 字节且 `key == url.PathEscape(key)`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分；每个 KV 有独立 nonce、ciphertext 与 `is_ephemeral`；只保留最新值 |
 | Secret DEK | 32-byte 随机数据密钥；每 Secret 一把；只保存由当前 Recipient 公钥包裹后的形式 |
 | Provider session | `mgcl run -- <command>` 子进程使用的短期 token；只允许 Secret read/write/delete/write-batch 固定路径 |
 
@@ -81,16 +81,17 @@ DB 与私钥的加载边界按命令区分：
 
 ### 3.2 名称、引用与值
 
-Secret name 由一个或多个 `/` 分隔的 segment 组成：
+Secret name 由一个或多个 `/` 分隔的非空 segment 组成：
 
 ```text
-segment = ^[a-z0-9][a-z0-9_-]{0,63}$
+segment = 1 个及以上字节，且 segment == url.PathEscape(segment)
 name    = segment ("/" segment)*    // 完整名称（含 /）长度 <= 64 字节
+key     = 非空，长度 <= 64 字节，且 key == url.PathEscape(key)
 ```
 
-每个 segment 是 1 到 64 个 ASCII 小写字母、数字、`_` 或 `-`，首字符必须是字母或数字。名称不能为空；空 segment、`.` 和 `..` 都由 segment 规则拒绝。旧单段名称继续兼容，不需要 schema migration。例如 `aws-605592676484-cn/scarborough` 合法。
+`url.PathEscape` 保留 ASCII 字母、数字以及 `-_.~$&+=:@` 等字符；`/`、空格、`%`、`?`、`#`、`*` 和非 ASCII 字节都会被转义，转义后的结果不等于原字符串，因此不能出现在 segment 或 key 中；空 segment 同样被拒绝。大小写、`.`、`..` 和前导 `-`/`_` 都合法；名称不作为文件路径，所以不额外禁止 `.`/`..`。`*` 会被转义为 `%2A`，因此 wildcard 引用不会与真实 key 冲突。旧单段名称全部继续合法，不需要 schema migration。例如 `net.sxxfuture.infra` 合法。
 
-KV key 仍是单个 segment，语法与 segment 相同，永远不能包含 `/`。
+KV key 遵循同一约束：非空、最多 64 字节且 `key == url.PathEscape(key)`；因为 `/` 会被转义，key 永远不能包含 `/`。
 
 完整 KV 引用为 `<secret-name>/<key>`，按**最后一个** `/` 拆分：左侧完整地作为 Secret name 校验，右侧作为单段 KV key 校验。不要按第一个 `/` 拆分，否则层级名称会被错误截断。没有 `/`、左侧为空（含 `//` 等空 segment）或右侧为空时按用法错误拒绝。function wildcard 同样以最后一个 `/` 切分。
 
@@ -841,7 +842,7 @@ Provider session 与 API：
 - `access` 空/`ephemeral` 返回全部 KV，不过滤标记；`public` 只返回 `is_ephemeral = 0` 的 KV；无匹配返回空 map，不做 Secret 级 403；坏 ephemeral 密文不影响 public 读取，但 all 读取失败；非法 access 返回 400；
 - write 自动创建 Secret/DEK/KV，更新 value 与 mark，空 value 合法，响应不含 value；请求省略 `is_ephemeral` 时按 `true`（ephemeral）处理；非法输入 400、超大 body 413、wrong recipient 403 `secret key access denied`、KV 数量/总量超限 400 `secret limit exceeded`；
 - write-batch 自动创建、`ensure` 空 Secret、纯 delete 不创建、保留未提及 KV、缺省 ephemeral、重复/重叠 400、最终配额按 delete+upsert 组合校验、原子回滚、响应不含 value、wrong recipient 403、body 2 MiB 上限和备份 dirty；
-- 层级 Secret name 与按最后一个 `/` 拆分的 KV 引用在 CLI、store、read/write/delete 和 function wildcard 合同中都通过；旧单段 name/ref 保持兼容；
+- 层级 Secret name、PathEscape-stable segment 与按最后一个 `/` 拆分的 KV 引用在 CLI、store、read/write/delete 和 function wildcard 合同中都通过；`net.sxxfuture.infra`、大小写、`.`/`..` 与前导 `-`/`_` 名称可创建，带点/大写的 KV key 可读写，`*` 仍非法；旧单段 name/ref 保持兼容；
 - delete 幂等、不创建 Secret、保留空 Secret；
 - 并发 HTTP write 同一新 Secret 的不同 key 只产生 1 个 Secret、1 把 DEK，全部 KV 可读；
 - 两个独立 Store 句柄并发写同一新 Secret 的不同 key，仍只产生 1 个 Secret、1 把 DEK，全部 KV 可读；验证跨 handle 的 `BEGIN IMMEDIATE` 与 busy timeout；
@@ -910,7 +911,7 @@ Provider session 与 API：
 - 存储：`internal/tacos/secret_store.go`、`internal/tacos/secret_envelope.go`。schema 为 `secrets` / `secret_deks` / `secret_kvs`，与 TACOS state 共用 `mgcl.db`、SSH identity 和迁移，但 label/AAD/fingerprint 独立。访问标记位于 `secret_kvs.is_ephemeral`（默认 1）；写路径使用 `BEGIN IMMEDIATE`、唯一约束、外键级联和事务。provider write 在同一事务中原子创建 Secret、DEK 与 KV；delete 幂等并保留空 Secret；write-batch 在同一事务中按最终集合原子 upsert/delete 并保留未提及 KV。
 - CLI：`cmd/secret.go`、`cmd/secret_output.go`。`list/show/create/set/get/unset/delete`，固定 flag、配置优先级、TTY 无回显、`--stdin`、`set --public`（只标记目标 KV）、`--yes`、备份接入和缺失 DB 边界；`list` 不显示 Secret 级访问列，`show` 逐 KV 暴露 `is_ephemeral`。
 - Provider session：`internal/tacos/provider_session.go`、`internal/tacos/provider.go`。`POST /api/mgcl/v1/secrets:read`（`access` 支持 `ephemeral` / `public`，空值按 ephemeral；ephemeral 返回全部 KV，public 只选择并解密 `is_ephemeral = 0` 的 KV，并返回 `ephemeral_marks`），以及 `POST /api/mgcl/v1/secret-kvs:write` / `secret-kvs:delete` / `secret-kvs:write-batch`；batch 在单个 `BEGIN IMMEDIATE` 事务中原子 upsert/delete、按最终集合校验限额、只返回 upsert 元数据；8 KiB 读取限制、512 KiB 单 KV 写入限制、2 MiB batch 限制、`Cache-Control: no-store`、安全固定错误文本，token 只存 SHA-256 摘要；provider token 被 TACOS 路由拒绝，用户 token 不能调用 provider 路径。
-- Secret 名称支持层级形式：每个 `/` segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称不超过 64 字节；KV key 仍为单段，完整引用按最后一个 `/` 拆分。旧单段名称和引用保持兼容，无 schema migration。
+- Secret 名称支持层级形式：每个 `/` segment 非空且满足 `segment == url.PathEscape(segment)`，完整名称不超过 64 字节；KV key 非空、最多 64 字节且 `key == url.PathEscape(key)`，完整引用按最后一个 `/` 拆分。大小写、`.`、`..`、前导 `-`/`_` 等 PathEscape-stable 名称合法；空格、`%`、`?`、`#`、`*` 与非 ASCII 非法。旧单段名称和引用保持兼容，无 schema migration。
 - `mgcl run`：只对有子进程的运行签发 provider session，注入 `MGCL_PROVIDER_ENDPOINT` / `MGCL_PROVIDER_TOKEN`，endpoint 从实际 listener 推导；用户 TACOS token 未配置时每次 run 自动生成，子进程模式只写入临时 CLI config，常驻模式在监听后打印一次；非 loopback 安全门在加载私钥、打开 DB、监听前执行。
 - 客户端：`pkg/providerapi`（stdlib-only、有限超时、不跟随重定向、2 MiB 响应上限、`ReadSecret` 发 ephemeral、`ReadPublicSecret` 发 public、`WriteSecretKV`、`DeleteSecretKV`、`WriteSecretKVs` 发 `secret-kvs:write-batch`）；`cmd/mgcl` 安装入口与根入口共用 `cmd.Main`。
 

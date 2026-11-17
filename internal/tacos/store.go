@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -273,8 +274,21 @@ type Workspace struct {
 	CreatedAt        string
 }
 
+// validWorkspaceName mirrors OpenTofu's workspace name validation: a name is
+// valid exactly when url.PathEscape leaves it unchanged. This rejects "/",
+// whitespace, "%", "?", "#", and non-ASCII characters, while ordinary
+// OpenTofu names stay valid. The empty string passes this check; callers that
+// require a name must reject it separately.
+func validWorkspaceName(name string) bool { return name == url.PathEscape(name) }
+
 // CreateWorkspace inserts a new workspace. Returns the generated ID.
 func (s *Store) CreateWorkspace(org, name, tfVersion string) (*Workspace, error) {
+	if name == "" {
+		return nil, ErrUnprocessable("name is required")
+	}
+	if !validWorkspaceName(name) {
+		return nil, ErrUnprocessable("invalid workspace name")
+	}
 	release, err := s.beginWrite()
 	if err != nil {
 		return nil, err

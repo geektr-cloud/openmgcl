@@ -6,7 +6,7 @@
 
 ## 1. 范围与不变量
 
-备份目标是写会话（write session）把当前 `mgcl.db` 覆盖复制到用户指定位置的可选功能。`mgcl run`、`mgcl secret create/set/unset/delete` 和 `mgcl state prune/delete/unlock` 都接入同一备份层。只读命令和只读请求不触发备份。
+备份目标是写会话（write session）把当前 `mgcl.db` 覆盖复制到用户指定位置的可选功能。`mgcl run`、`mgcl secret create/set/unset/delete` 和 `mgcl state prune/delete/unlock/rename` 都接入同一备份层。只读命令和只读请求不触发备份。
 
 不变量：
 
@@ -21,7 +21,7 @@
 
 ## 2. 术语与两种语义
 
-**Write session（写会话）**：打开 `mgcl.db` 并可能提交写入的进程生命周期。`mgcl run` 是写会话，即使本次没有实际写入；`mgcl secret create/set/unset/delete` 也是写会话；`mgcl state prune/delete/unlock` 同样是写会话。`mgcl secret list/show/get`、`mgcl state list/stats/info/export` 等只读命令不是。
+**Write session（写会话）**：打开 `mgcl.db` 并可能提交写入的进程生命周期。`mgcl run` 是写会话，即使本次没有实际写入；`mgcl secret create/set/unset/delete` 也是写会话；`mgcl state prune/delete/unlock/rename` 同样是写会话。`mgcl secret list/show/get`、`mgcl state list/stats/info/export` 等只读命令不是。
 
 **Backup destination（备份目标）**：配置中的一个 `<scheme>:<path>` 条目。scheme 只允许 `sqlite` 和 `path`，首版不接受其他值。
 
@@ -149,7 +149,7 @@ mgcl run --db ./mgcl.db \
 ### 5.2 dirty 标记与后台 worker
 
 - 每个成功提交的写事务在提交返回后标记一次 dirty。标记必须发生在提交之后，不能在事务内；事务回滚不得标记。dirty 标记是幂等的合并信号，不携带数据、不阻塞写路径。
-- 所有写路径都必须接到同一个标记点：初始备份之后，当前包括 workspace 创建、lock/unlock、state version 创建、state/JSON state 上传、`mgcl state prune/delete/unlock`，以及 secret create/set/unset/delete；备份层启动后的 schema 变更同样接入。打开数据库时、初始备份之前完成的迁移/建表已经包含在初始备份中，不额外标记一轮。只读查询不标记。
+- 所有写路径都必须接到同一个标记点：初始备份之后，当前包括 workspace 创建、lock/unlock、state version 创建、state/JSON state 上传、`mgcl state prune/delete/unlock/rename`，以及 secret create/set/unset/delete；备份层启动后的 schema 变更同样接入。打开数据库时、初始备份之前完成的迁移/建表已经包含在初始备份中，不额外标记一轮。只读查询不标记。
 - 只有一个后台 worker。dirty 标记唤醒 worker；worker 立即按配置顺序依次同步所有 `sqlite:` 目标。没有 ticker、没有固定周期；没有 dirty 时不复制。
 - 写会话有独立的写 gate。Store 的每个公开写方法从关闭检查开始，到事务 commit 与 `MarkDirty` 都持读锁；`StopWrites` 获取写锁、设置 closed 并等待全部在途写完成后才返回。closed 后所有新写立即拒绝。`Store.Close`/`Abort` 自身也先执行 `StopWrites`，SecretStore 同样如此。
 - Manager 的 `BeginShutdown` 关闭 dirty 标记入口；此后 `MarkDirty` 返回错误并记录 late dirty。`Shutdown` 在 worker drain 后和返回前都检查该标记，存在 late dirty 时返回错误，不能静默成功。正常 Store 路径在 gate 等待后不应出现 late 标记。
@@ -255,7 +255,7 @@ rename 是一种文件替换：目标最终是刚创建的新文件，旧目标�
 
 所有写会话必须复用同一备份层，不能各自实现复制逻辑：
 
-- 当前 `mgcl run` 已接入；`mgcl secret create/set/unset/delete` 也已接入，同为写会话；`mgcl state prune/delete/unlock` 同样接入。
+- 当前 `mgcl run` 已接入；`mgcl secret create/set/unset/delete` 也已接入，同为写会话；`mgcl state prune/delete/unlock/rename` 同样接入。
 - `mgcl secret list/show/get`、`mgcl state list/stats/info/export`、TACOS 只读查询、provider session 的只读读取不触发备份，不 probe，不创建备份目标。
 - 空备份列表时备份层完全禁用：不改变启动、写入、关闭顺序，也不产生额外文件或日志。
 - 同一 `mgcl.db` 同时只应有一个写会话。备份层不提供跨进程协调；外部进程同时写库时，`sqlite:` 可能遇到 busy 并失败，`path:` 的 checkpoint 会因 busy 失败。并发写会话不在首版保证内。
@@ -350,7 +350,7 @@ rename 是一种文件替换：目标最终是刚创建的新文件，旧目标�
 ## 12. 实现状态说明
 
 - 备份层位于 `internal/sqlitebackup`，不依赖 TACOS handler；`internal/tacos.Store` 和 `internal/tacos.SecretStore` 只在成功提交后标记 dirty，并在 `Close` 中执行 drain/checkpoint/copy 顺序。
-- `mgcl run` 已接入 `--backup-to` 和 YAML `backup_to`；`mgcl secret create/set/unset/delete` 也已接入；`mgcl state prune/delete/unlock` 同样接入。`mgcl secret list/show/get` 与 `mgcl state list/stats/info/export` 不触发备份。
+- `mgcl run` 已接入 `--backup-to` 和 YAML `backup_to`；`mgcl secret create/set/unset/delete` 也已接入；`mgcl state prune/delete/unlock/rename` 同样接入。`mgcl secret list/show/get` 与 `mgcl state list/stats/info/export` 不触发备份。
 - 已存在 `sqlite:` 目标的可写性由初始 Online Backup 实际验证；它仍发生在监听端口和接受流量之前，失败按启动失败处理。
 - 为了从 `Step(-1)` 到 DONE 的循环、每轮新 handle、临时文件/rename 和固定关闭顺序，实现与本文合同一致；没有引入 `VACUUM INTO`、周期 ticker 或 `MGCL_BACKUP_TO`。
 

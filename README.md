@@ -77,7 +77,7 @@ mgcl secret delete bootstrap --yes --db ./mgcl.db
 
 约束：
 
-- Secret name 由一个或多个 `/` 分隔的 segment 组成，每个 segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称（含 `/`）不超过 64 字节；KV key 仍是单个 segment，不能含 `/`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分；
+- Secret name 由一个或多个 `/` 分隔的非空 segment 组成，每个 segment 满足 `segment == url.PathEscape(segment)`，完整名称（含 `/`）不超过 64 字节；KV key 非空、最多 64 字节且满足 `key == url.PathEscape(key)`，因此不含 `/`；完整引用 `<secret-name>/<key>` 按最后一个 `/` 拆分。大小写、`.`、`..`、前导 `-`/`_` 等 PathEscape-stable 名称合法；空格、`%`、`?`、`#`、`*` 和非 ASCII 非法；
 - value 必须是 UTF-8，单值最多 64 KiB，每个 Secret 最多 64 个 KV、合计最多 256 KiB；
 - 新建 KV 默认 `is_ephemeral = 1`；`set --public` 只把该 KV 转为 `0`，普通 `set` 保留已有 KV 的标记；CLI 没有反向 flag，但 provider 写 API 可以把标记改回 `true`；`create` 不接受 `--public`；
 - provider 读取 `access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV；没有 public KV 时返回空 map，不报 Secret 级 403；非 public KV 不会被选择或解密；
@@ -298,7 +298,7 @@ mgcl run --db ./mgcl.db \
 
 ## State 管理
 
-`mgcl state` 离线管理同一个 `mgcl.db` 中的 workspace 与 state 版本，不需要启动服务或配置 token。workspace 用 `<organization>/<workspace>` 引用；配置继承 `mgcl run` 与 `<git-root>/.mgcl.yaml`。
+`mgcl state` 离线管理同一个 `mgcl.db` 中的 workspace 与 state 版本，不需要启动服务或配置 token。workspace 用 `<organization>/<workspace>` 引用；配置继承 `mgcl run` 与 `<git-root>/.mgcl.yaml`。workspace 名称必须满足 `name == url.PathEscape(name)`，与 OpenTofu 的 workspace 校验一致：不能包含 `/`、空格、`%`、`?`、`#` 或非 ASCII 字符，常规 OpenTofu 名称保持有效。既有数据库中的名称不做迁移。
 
 | 命令 | 作用 |
 |---|---|
@@ -309,15 +309,17 @@ mgcl run --db ./mgcl.db \
 | `mgcl state prune <ref> --keeps <n>` | 只保留最近 n 个 finalized 版本 |
 | `mgcl state delete <ref>` | 删除 workspace 及其全部版本 |
 | `mgcl state unlock <ref>` | 离线强制解锁 |
+| `mgcl state rename <src> <dest>` | 改名或跨 organization 移动 workspace，保留全部版本 |
 
 ```bash
 mgcl state list --db ./mgcl.db
 mgcl state info local/demo --db ./mgcl.db
 mgcl state export local/demo -f demo.tfstate.json --db ./mgcl.db
 mgcl state prune local/demo --keeps 5 --db ./mgcl.db
+mgcl state rename local/demo staging/demo --db ./mgcl.db
 ```
 
-`list`、`stats`、`info`、`export` 是只读命令，不创建、迁移或备份数据库；`export` 需要私钥，输出可能含敏感明文。`prune`、`delete` 与需要清除 lock 的 `unlock` 是写会话，复用 `--backup-to` / `backup_to` 备份层。`prune` 和 `delete` 遇到 lock 会拒绝，需先停止所有写进程再 `unlock`；两者要求输入完整 State reference 确认，非交互时用 `--yes-i-know-this-will-permanently-delete-this-state`。`unlock` 锁定时没有非交互绕过。
+`list`、`stats`、`info`、`export` 是只读命令，不创建、迁移或备份数据库；`export` 需要私钥，输出可能含敏感明文。`prune`、`delete`、`unlock` 与 `rename` 是写会话，复用 `--backup-to` / `backup_to` 备份层。`prune` 和 `delete` 遇到 lock 会拒绝，需先停止所有写进程再 `unlock`；两者要求输入完整 State reference 确认，非交互时用 `--yes-i-know-this-will-permanently-delete-this-state`。`unlock` 锁定时没有非交互绕过。`rename` 不破坏数据，不需要确认或 `--yes`，可在非 TTY 执行；源 workspace 必须存在且未锁定，目标已存在或与源相同时拒绝覆盖。
 
 `stats` 的 `SIZE` 是三个加密 blob 列（`state`、`json_state`、`json_state_outputs`）的长度和，不含 SQLite 页、索引、空闲空间或 WAL，不等于数据库文件大小。`prune`/`delete` 不 `VACUUM`，文件不保证缩小，也不清理 lineage keys。完整语义见 [docs/state-management.md](docs/state-management.md)。
 
@@ -349,7 +351,8 @@ TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Auth
 
 - 只做 state 存储；没有 runs、variables、policies、teams、VCS 等 TFC 功能。
 - workspace 固定 local 执行模式，entitlement-set 返回 `operations: false`。
-- workspace 只支持创建、列表、按 name 查询、加锁和更新 `terraform-version`；TACOS API 没有 workspace delete，离线删除用 `mgcl state delete`。
+- workspace 只支持创建、列表、按 name 查询、加锁和更新 `terraform-version`；TACOS API 没有 workspace delete 或 rename，离线删除用 `mgcl state delete`，离线改名用 `mgcl state rename`。
+- workspace 名称沿用 OpenTofu 的校验 `name == url.PathEscape(name)`：不能包含 `/`、空格、`%`、`?`、`#` 或非 ASCII 字符；创建时返回 422，既有数据不做迁移。
 - discovery 同时通告 `state.v2`、`tfe.v2`、`tfe.v2.1`，原因见 [ADR-0001](docs/adr/0001-advertise-service-ids-beyond-implemented-scope.md)。未实现的端点会返回 404。
 - SQLite 单连接，面向本地单用户；不要拿它做多租户服务。
 - 上传/下载 URL 按设计免认证，靠随机 ID 保护；不要暴露到不可信网络。
@@ -361,7 +364,7 @@ TACOS API 除 discovery、ping 和 foreign upload/download 外始终要求 `Auth
 - 上传 raw state / JSON state 上限约 100MiB；含 base64 inline state 的 create 请求留有 base64 余量；workspace 和 lock 请求上限 1MiB；超限返回 413。
 - 加密范围只有 `state`、`json_state`、`json_state_outputs`；workspace 名称、serial、lineage、MD5 等元数据保持明文。
 - 每个 State Lineage 一把密钥，首版每个 lineage 只登记一个 Recipient；没有 grant、rotate、rewrap 或恢复命令。
-- 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。Secret name 可含多个 `/` segment，完整名称不超过 64 字节；KV key 不含 `/`。
+- 每个 Secret 一把独立 Secret DEK，首版只包裹给一个 Recipient；没有 rotation、rewrap 或多 Recipient。Secret 单值 64 KiB、每 Secret 64 KV、合计 256 KiB，只保留最新值。Secret name 可含多个 `/` segment，完整名称不超过 64 字节，每段满足 `segment == url.PathEscape(segment)`，大小写、`.`、`..` 与前导 `-`/`_` 合法；KV key 满足同一约束且不含 `/`。
 - Secret 的访问标记属于每个 KV：新建 KV 默认 ephemeral；`set --public` 只把目标 KV 转为 public，普通 `set` 保留已有标记。public 只改变该 KV 的访问类别，不改变静态加密，也不意味着数据库中是明文。`access: "ephemeral"` 返回全部 KV，`access: "public"` 只返回 public KV，没有匹配时返回空 map。
 - provider session 只由 `mgcl run --` 子进程获得，常驻 run 没有 provider token。子进程模式下自动生成的用户 token 只存在于本次临时 CLI config 和进程生命周期；常驻模式会打印一次供外部配置。provider token 是短期、限定路径的凭证，可读 Secret KV 并供 managed resource 调用 write/delete/write-batch，不是 TACOS 用户 token，也不能执行其他 Secret 管理操作。
 - Secret 写入与 `mgcl run` 共用同一个 `mgcl.db` 和备份层；同一数据库不应同时运行多个写会话。备份不含明文 value，恢复仍只依赖 `mgcl.db` 和私钥。

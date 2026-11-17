@@ -194,6 +194,34 @@ func TestE2EStateCLI(t *testing.T) {
 		t.Fatalf("prune kept the wrong versions:\n%s", out)
 	}
 
+	// Rename across organizations keeps the workspace and its current version.
+	code, out = run("rename", "acme/dev", "acme-prod/dev")
+	if code != 0 {
+		t.Fatalf("state rename exit %d:\n%s", code, out)
+	}
+	if !strings.Contains(out, "Renamed state from acme/dev to acme-prod/dev.") {
+		t.Fatalf("state rename result missing:\n%s", out)
+	}
+	code, out = run("info", "acme/dev")
+	if code == 0 {
+		t.Fatalf("old reference still exists after rename:\n%s", out)
+	}
+	code, out = run("info", "acme-prod/dev")
+	if code != 0 || !strings.Contains(out, devVersions[2].ID) {
+		t.Fatalf("state info on renamed reference exit %d:\n%s", code, out)
+	}
+	code, stdout, stderr = runMgclSplit(t, bin, dir, baseEnv(), args("export", "acme-prod/dev")...)
+	if code != 0 {
+		t.Fatalf("state export after rename exit %d:\n%s", code, stderr)
+	}
+	if stdout != string(e2eStateJSON(3)) {
+		t.Fatalf("state export after rename = %q, want %q", stdout, e2eStateJSON(3))
+	}
+	code, out = run("list")
+	if code != 0 || !strings.Contains(out, "acme-prod/dev") || strings.Contains(out, "acme/dev") {
+		t.Fatalf("state list after rename exit %d:\n%s", code, out)
+	}
+
 	// A locked workspace refuses state-changing commands and reports its lock.
 	code, out = run("delete", "acme/locked", "--"+e2eStateDeleteBypassFlag)
 	if code == 0 {
@@ -222,18 +250,18 @@ func TestE2EStateCLI(t *testing.T) {
 		t.Fatalf("state unlock no-op exit %d:\n%s", code, out)
 	}
 
-	code, out = run("delete", "acme/dev", "--"+e2eStateDeleteBypassFlag)
+	code, out = run("delete", "acme-prod/dev", "--"+e2eStateDeleteBypassFlag)
 	if code != 0 {
 		t.Fatalf("state delete exit %d:\n%s", code, out)
 	}
-	if !strings.Contains(out, "Deleted state for acme/dev") {
+	if !strings.Contains(out, "Deleted state for acme-prod/dev") {
 		t.Fatalf("state delete result missing:\n%s", out)
 	}
 	code, out = run("list")
 	if code != 0 {
 		t.Fatalf("state list after delete exit %d:\n%s", code, out)
 	}
-	if strings.Contains(out, "acme/dev") {
+	if strings.Contains(out, "acme-prod/dev") || strings.Contains(out, "acme/dev") {
 		t.Fatalf("deleted workspace still listed:\n%s", out)
 	}
 }

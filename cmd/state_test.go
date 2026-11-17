@@ -3,6 +3,7 @@ package cmd
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -889,6 +890,168 @@ func TestStateCLIUnlockConfirmationAndBackup(t *testing.T) {
 	}
 }
 
+func TestStateCLIRename(t *testing.T) {
+	h := newStateCLI(t)
+	var seeded *seededWorkspace
+	h.withStore(t, func(store *tacos.Store) {
+		seeded = seedStateWorkspace(t, store, "acme", "dev", 2, 1)
+	})
+	stubNonTTY(t)
+
+	stdout, stderr, err := runCLI(t, "", h.args("rename", "acme/dev", "acme-prod/dev-renamed")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "" {
+		t.Fatalf("rename wrote to stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "Renamed state from acme/dev to acme-prod/dev-renamed.") {
+		t.Fatalf("rename result missing:\n%s", stderr)
+	}
+
+	if _, _, err := runCLI(t, "", h.args("info", "acme/dev")...); err == nil {
+		t.Fatal("old reference still exists after rename")
+	}
+	stdout, _, err = runCLI(t, "", h.args("info", "acme-prod/dev-renamed")...)
+	if err != nil {
+		t.Fatalf("info on new reference: %v", err)
+	}
+	for _, id := range []string{seeded.finalized[0].ID, seeded.finalized[1].ID, seeded.pending[0].ID} {
+		if !strings.Contains(stdout, id) {
+			t.Fatalf("version %s missing after rename:\n%s", id, stdout)
+		}
+	}
+
+	h.withStore(t, func(store *tacos.Store) {
+		got, err := store.GetWorkspace("acme-prod", "dev-renamed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ID != seeded.workspace.ID {
+			t.Fatalf("workspace ID = %q, want preserved %q", got.ID, seeded.workspace.ID)
+		}
+		if got.CreatedAt != seeded.workspace.CreatedAt {
+			t.Fatalf("created_at = %q, want preserved %q", got.CreatedAt, seeded.workspace.CreatedAt)
+		}
+	})
+
+	stdout, _, err = runCLI(t, "", h.args("export", "acme-prod/dev-renamed")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != string(stateJSONState(2)) {
+		t.Fatalf("export after rename = %q, want %q", stdout, stateJSONState(2))
+	}
+
+	stdout, _, err = runCLI(t, "", h.args("list")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, "acme-prod/dev-renamed") || strings.Contains(stdout, "acme/dev") {
+		t.Fatalf("list after rename:\n%s", stdout)
+	}
+}
+
+func TestStateCLIRenameValidatesReferencesBeforeDatabase(t *testing.T) {
+	h := newStateCLI(t)
+	stubNonTTY(t)
+
+	cases := [][2]string{
+		{"acme", "acme/dev"},
+		{"acme/dev", "acme"},
+		{"acme/a b", "acme/dev"},
+		{"acme/dev", "acme/a b"},
+		{"acme/a%b", "acme/dev"},
+		{"acme/dev", "acme/a/b"},
+		{"acme/dev", "acme/a%2Fb"},
+		{"", "acme/dev"},
+	}
+	for _, tc := range cases {
+		_, _, err := runCLI(t, "", h.args("rename", tc[0], tc[1])...)
+		if err == nil || !strings.Contains(err.Error(), "state reference") {
+			t.Fatalf("rename %q -> %q error = %v, want a state reference error", tc[0], tc[1], err)
+		}
+	}
+	if _, err := os.Stat(h.db); !os.IsNotExist(err) {
+		t.Fatalf("invalid rename opened or created the database: %v", err)
+	}
+}
+
+func TestStateCLIRenameRejectsWithoutChanges(t *testing.T) {
+	h := newStateCLI(t)
+	var dev, keep, locked *seededWorkspace
+	h.withStore(t, func(store *tacos.Store) {
+		dev = seedStateWorkspace(t, store, "acme", "dev", 1, 0)
+		keep = seedStateWorkspace(t, store, "acme", "keep", 1, 0)
+		locked = seedStateWorkspace(t, store, "acme", "locked", 1, 0)
+		if err := store.LockWorkspace(locked.workspace.ID, `{"id":"lock-1"}`); err != nil {
+			t.Fatal(err)
+		}
+	})
+	stubNonTTY(t)
+
+	if _, _, err := runCLI(t, "", h.args("rename", "acme/dev", "acme/dev")...); err == nil || !strings.Contains(err.Error(), "same workspace") {
+		t.Fatalf("same-reference rename error = %v", err)
+	}
+	if _, _, err := runCLI(t, "", h.args("rename", "acme/dev", "acme/keep")...); err == nil {
+		t.Fatal("rename onto an existing workspace succeeded")
+	}
+	if _, _, err := runCLI(t, "", h.args("rename", "acme/missing", "acme/new")...); err == nil {
+		t.Fatal("rename from a missing workspace succeeded")
+	}
+	if _, _, err := runCLI(t, "", h.args("rename", "acme/locked", "acme/moved")...); err == nil ||
+		!strings.Contains(err.Error(), "locked") || !strings.Contains(err.Error(), "mgcl state unlock acme/locked") {
+		t.Fatalf("locked rename error = %v", err)
+	}
+
+	h.withStore(t, func(store *tacos.Store) {
+		for _, tc := range []struct {
+			ref string
+			id  string
+		}{
+			{"acme/dev", dev.workspace.ID},
+			{"acme/keep", keep.workspace.ID},
+			{"acme/locked", locked.workspace.ID},
+		} {
+			org, name, err := tacos.ParseStateReference(tc.ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.GetWorkspace(org, name)
+			if err != nil {
+				t.Fatalf("%s disappeared after rejected rename: %v", tc.ref, err)
+			}
+			if got.ID != tc.id {
+				t.Fatalf("%s ID = %q, want %q", tc.ref, got.ID, tc.id)
+			}
+		}
+		for _, ref := range []string{"acme/new", "acme/moved"} {
+			if _, err := store.GetWorkspace("acme", strings.TrimPrefix(ref, "acme/")); !tacos.IsAPIError(err, http.StatusNotFound) {
+				t.Fatalf("%s was created by a rejected rename: %v", ref, err)
+			}
+		}
+	})
+}
+
+func TestStateCLIRenameBackupFailureDoesNotRename(t *testing.T) {
+	h := newStateCLI(t)
+	h.withStore(t, func(store *tacos.Store) {
+		seedStateWorkspace(t, store, "acme", "dev", 1, 0)
+	})
+	stubNonTTY(t)
+
+	_, _, err := runCLI(t, "", h.args("rename", "acme/dev", "acme/moved", "--backup-to", "sqlite:"+h.db)...)
+	if err == nil {
+		t.Fatal("rename with an invalid backup destination succeeded")
+	}
+	if _, _, err := runCLI(t, "", h.args("info", "acme/dev")...); err != nil {
+		t.Fatalf("source disappeared after failed backup: %v", err)
+	}
+	if _, _, err := runCLI(t, "", h.args("info", "acme/moved")...); err == nil {
+		t.Fatal("destination exists after failed backup")
+	}
+}
+
 func TestStateCLIListMissingDatabase(t *testing.T) {
 	h := newStateCLI(t)
 	stdout, _, err := runCLI(t, "", h.args("list")...)
@@ -908,7 +1071,7 @@ func TestStateCLIHelp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"list", "stats", "info", "export", "prune", "delete", "unlock", "--db", "--encryption-key-file", "--backup-to"} {
+	for _, want := range []string{"list", "stats", "info", "export", "prune", "delete", "unlock", "rename", "--db", "--encryption-key-file", "--backup-to"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("state --help missing %q", want)
 		}

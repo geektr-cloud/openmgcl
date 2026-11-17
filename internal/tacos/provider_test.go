@@ -183,7 +183,7 @@ func TestSecretsReadAPI(t *testing.T) {
 		{"get", http.MethodGet, "", "live", http.StatusMethodNotAllowed},
 		{"malformed", http.MethodPost, `{"name":`, "live", http.StatusBadRequest},
 		{"missing name", http.MethodPost, `{}`, "live", http.StatusBadRequest},
-		{"invalid name", http.MethodPost, `{"name":"Bad/Name"}`, "live", http.StatusBadRequest},
+		{"invalid name", http.MethodPost, `{"name":"Bad//Name"}`, "live", http.StatusBadRequest},
 		{"unknown", http.MethodPost, `{"name":"unknown"}`, "live", http.StatusNotFound},
 		{"oversized", http.MethodPost, `{"name":"` + strings.Repeat("a", 9000) + `"}`, "live", http.StatusRequestEntityTooLarge},
 		{"trailing", http.MethodPost, `{"name":"bootstrap"} {}`, "live", http.StatusBadRequest},

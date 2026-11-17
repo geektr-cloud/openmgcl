@@ -56,6 +56,9 @@ func ParseStateReference(ref string) (organization, workspace string, err error)
 	if workspace == "" {
 		return "", "", errors.New("state reference workspace is empty")
 	}
+	if !validWorkspaceName(workspace) {
+		return "", "", fmt.Errorf("state reference workspace %q is not a valid workspace name", workspace)
+	}
 	return organization, workspace, nil
 }
 
@@ -437,6 +440,86 @@ func (s *Store) DeleteState(org, workspace string) error {
 	}
 	if deleted == 0 {
 		return ErrNotFound("workspace not found")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.markDirty()
+}
+
+// RenameState changes one workspace's organization and/or name in a single
+// transaction. The workspace ID, created_at, lock state, encrypted state blobs,
+// versions, version IDs, and lineage are preserved. Renaming to the same
+// reference or onto an existing workspace is a conflict; the destination is
+// never overwritten. A locked source is rejected.
+func (s *Store) RenameState(srcOrg, srcWorkspace, destOrg, destWorkspace string) error {
+	sourceOrg, sourceName, err := ParseStateReference(srcOrg + "/" + srcWorkspace)
+	if err != nil {
+		return err
+	}
+	destinationOrg, destinationName, err := ParseStateReference(destOrg + "/" + destWorkspace)
+	if err != nil {
+		return err
+	}
+	if sourceOrg == destinationOrg && sourceName == destinationName {
+		return ErrConflict("source and destination are the same workspace")
+	}
+	ready, err := s.stateReadReady()
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return ErrNotFound("workspace not found")
+	}
+
+	release, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var wsID string
+	var locked int
+	err = tx.QueryRow(
+		`SELECT id, locked FROM workspaces WHERE organization = ? AND name = ?`,
+		sourceOrg, sourceName,
+	).Scan(&wsID, &locked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound("workspace not found")
+	}
+	if err != nil {
+		return err
+	}
+	if locked != 0 {
+		return ErrConflict("workspace is locked")
+	}
+
+	var existing string
+	err = tx.QueryRow(
+		`SELECT id FROM workspaces WHERE organization = ? AND name = ?`,
+		destinationOrg, destinationName,
+	).Scan(&existing)
+	if err == nil {
+		return ErrConflict("workspace already exists")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE workspaces SET organization = ?, name = ? WHERE id = ?`,
+		destinationOrg, destinationName, wsID,
+	); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return ErrConflict("workspace already exists")
+		}
+		return fmt.Errorf("rename workspace: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err

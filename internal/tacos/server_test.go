@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -248,6 +249,51 @@ func TestWorkspaceCRUD(t *testing.T) {
 	pag := meta["pagination"].(map[string]any)
 	if int(pag["total-count"].(float64)) != 2 {
 		t.Errorf("total-count = %v, want 2", pag["total-count"])
+	}
+}
+
+func TestCreateWorkspaceHTTPRejectsInvalidName(t *testing.T) {
+	ts, store := newTestServer(t, "")
+	defer ts.Close()
+
+	invalid := []string{"a b", "a/b", "a%b", "a%2Fb", "a?b", "a#b", "工作区"}
+	for _, name := range invalid {
+		resp := postJSON(t, ts.URL+"/api/v2/organizations/dev/workspaces", map[string]any{
+			"data": map[string]any{"attributes": map[string]any{"name": name}},
+		}, "")
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Errorf("create workspace %q: status = %d, want 422: %s", name, resp.StatusCode, body)
+		}
+	}
+
+	resp := postJSON(t, ts.URL+"/api/v2/organizations/dev/workspaces", map[string]any{
+		"data": map[string]any{"attributes": map[string]any{"name": ""}},
+	}, "")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("create empty workspace: status = %d, want 422: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "name is required") {
+		t.Fatalf("empty name error = %s, want name is required", body)
+	}
+
+	workspaces, total, err := store.ListWorkspaces("dev", "", 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 || len(workspaces) != 0 {
+		t.Fatalf("invalid names inserted %d workspaces", total)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/v2/organizations/dev/workspaces", map[string]any{
+		"data": map[string]any{"attributes": map[string]any{"name": "ws+1"}},
+	}, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create workspace ws+1: status = %d, want 201", resp.StatusCode)
 	}
 }
 

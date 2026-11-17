@@ -523,6 +523,58 @@ func TestSecretCLIHierarchicalNames(t *testing.T) {
 	}
 }
 
+func TestSecretCLIPathEscapeNames(t *testing.T) {
+	h := newSecretCLI(t)
+	stubNonTTY(t)
+	name := "net.sxxfuture.infra"
+
+	if _, stderr, err := runCLI(t, "", h.args("create", name)...); err != nil {
+		t.Fatal(err)
+	} else if !strings.Contains(stderr, `Created secret "`+name+`"`) {
+		t.Fatalf("create stderr = %q", stderr)
+	}
+	if _, _, err := runCLI(t, "", h.args("set", name+"/API.Key", "dotted-value")...); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCLI(t, "", h.args("get", name+"/API.Key")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "dotted-value" {
+		t.Fatalf("get = %q", stdout)
+	}
+	stdout, _, err = runCLI(t, "", h.args("show", name, "-o", "json")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout, `"name": "`+name+`"`) || !strings.Contains(stdout, `"key": "API.Key"`) {
+		t.Fatalf("show = %s", stdout)
+	}
+
+	// "*" is not PathEscape-stable, so the wildcard reference stays invalid.
+	if _, _, err := runCLI(t, "", h.args("set", name+"/*", "value")...); err == nil {
+		t.Fatal("wildcard key was accepted")
+	}
+}
+
+func TestSecretCLIInvalidInputFailsBeforeDatabase(t *testing.T) {
+	h := newSecretCLI(t)
+	stubNonTTY(t)
+	for _, args := range [][]string{
+		{"create", "bad name"},
+		{"create", "net//name"},
+		{"set", "net.name/bad key", "value"},
+		{"get", "net.name/*"},
+	} {
+		if _, _, err := runCLI(t, "", h.args(args...)...); err == nil {
+			t.Errorf("%v was accepted", args)
+		}
+		if _, err := os.Stat(h.db); !os.IsNotExist(err) {
+			t.Errorf("%v created the database", args)
+		}
+	}
+}
+
 func TestSecretCLISetInputModes(t *testing.T) {
 	h := newSecretCLI(t)
 	stubNonTTY(t)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,6 +53,9 @@ func TestParseStateReference(t *testing.T) {
 		{"org-name/ws_name", "org-name", "ws_name"},
 		{"a/b", "a", "b"},
 		{"a.b/c.d", "a.b", "c.d"},
+		{"org/ws+1", "org", "ws+1"},
+		{"org/ws:1", "org", "ws:1"},
+		{"org/ws@1", "org", "ws@1"},
 	}
 	for _, tc := range valid {
 		org, name, err := ParseStateReference(tc.ref)
@@ -73,11 +77,73 @@ func TestParseStateReference(t *testing.T) {
 		"org//ws",
 		"a/b/c",
 		"/",
+		"org/a b",
+		"org/a%b",
+		"org/a%2Fb",
+		"org/a?b",
+		"org/a#b",
+		"org/工作区",
 	}
 	for _, ref := range invalid {
 		if _, _, err := ParseStateReference(ref); err == nil {
 			t.Errorf("ParseStateReference(%q) accepted an invalid reference", ref)
 		}
+	}
+}
+
+func TestValidWorkspaceNameMatchesPathEscape(t *testing.T) {
+	for _, name := range []string{
+		"ws", "ws-name", "ws_name", "ws.name", "ws~name",
+		"ws+1", "ws:1", "ws=1", "ws@1", "ws&1", "ws$1",
+	} {
+		if !validWorkspaceName(name) {
+			t.Errorf("validWorkspaceName(%q) = false, want true", name)
+		}
+	}
+
+	// "/" is the clearest PathEscape difference: escaping a workspace name
+	// with a slash produces "%2F", so the name cannot round-trip unchanged.
+	if got := url.PathEscape("a/b"); got == "a/b" {
+		t.Fatalf("url.PathEscape(%q) = %q, expected an escaped difference", "a/b", got)
+	}
+	for _, name := range []string{
+		"a/b", "a b", "a%b", "a%2Fb", "a?b", "a#b", "工作区",
+	} {
+		if validWorkspaceName(name) {
+			t.Errorf("validWorkspaceName(%q) = true, want false", name)
+		}
+		if escaped := url.PathEscape(name); escaped == name {
+			t.Errorf("url.PathEscape(%q) left the name unchanged", name)
+		}
+	}
+}
+
+func TestCreateWorkspaceRejectsInvalidName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mgcl.db")
+	store := openTestStateStore(t, path, testIdentity(t))
+
+	for _, name := range []string{"a b", "a/b", "a%b", "a%2Fb", "a?b", "a#b", "工作区"} {
+		if _, err := store.CreateWorkspace("org", name, ""); !IsAPIError(err, http.StatusUnprocessableEntity) {
+			t.Errorf("CreateWorkspace(%q) error = %v, want 422", name, err)
+		}
+	}
+	if _, err := store.CreateWorkspace("org", "", ""); !IsAPIError(err, http.StatusUnprocessableEntity) {
+		t.Errorf("CreateWorkspace(empty) error = %v, want 422", err)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM workspaces`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid names inserted %d workspaces", count)
+	}
+
+	ws, err := store.CreateWorkspace("org", "ws+1", "")
+	if err != nil {
+		t.Fatalf("CreateWorkspace with a PathEscape-stable name failed: %v", err)
+	}
+	if ws.Name != "ws+1" {
+		t.Fatalf("created workspace name = %q, want ws+1", ws.Name)
 	}
 }
 
@@ -606,6 +672,198 @@ func TestStateDelete(t *testing.T) {
 		}
 		if versionCount != 1 {
 			t.Fatalf("state_versions rows = %d, want 1", versionCount)
+		}
+	})
+}
+
+func TestStateRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mgcl.db")
+	store := openTestStateStore(t, path, testIdentity(t))
+	ws := createStateTestWorkspace(t, store, "acme", "dev")
+	v1 := createTestStateVersion(t, store, ws.ID, 1, "lineage-rename", "md5-1", []byte("raw-1"), []byte(`{"serial":1}`), []byte(`{"out":1}`))
+	v2 := createTestStateVersion(t, store, ws.ID, 2, "lineage-rename", "md5-2", []byte("raw-2"), []byte(`{"serial":2}`), []byte(`{"out":2}`))
+	pending := createTestStateVersion(t, store, ws.ID, 3, "lineage-rename", "md5-3", nil, []byte(`{"pending":true}`), nil)
+
+	before, err := store.GetWorkspaceByID(ws.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeState, beforeJSON []byte
+	if err := store.db.QueryRow(
+		`SELECT state, json_state FROM state_versions WHERE id = ?`, v2.ID,
+	).Scan(&beforeState, &beforeJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	// Renaming across organizations changes both parts and keeps everything else.
+	if err := store.RenameState("acme", "dev", "acme-prod", "dev-renamed"); err != nil {
+		t.Fatalf("RenameState: %v", err)
+	}
+	renamed, err := store.GetStateWorkspace("acme-prod", "dev-renamed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.ID != ws.ID {
+		t.Fatalf("renamed ID = %q, want preserved %q", renamed.ID, ws.ID)
+	}
+	if renamed.Organization != "acme-prod" || renamed.Name != "dev-renamed" {
+		t.Fatalf("renamed reference = %q/%q", renamed.Organization, renamed.Name)
+	}
+	if renamed.CreatedAt != before.CreatedAt {
+		t.Fatalf("created_at = %q, want preserved %q", renamed.CreatedAt, before.CreatedAt)
+	}
+	if _, err := store.GetStateWorkspace("acme", "dev"); !IsAPIError(err, http.StatusNotFound) {
+		t.Fatalf("old reference error = %v, want 404", err)
+	}
+
+	info, err := store.ListStateVersionInfo("acme-prod", "dev-renamed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info) != 3 {
+		t.Fatalf("versions after rename = %+v, want 3", info)
+	}
+	seen := map[string]bool{}
+	for _, item := range info {
+		seen[item.ID] = true
+	}
+	for _, id := range []string{v1.ID, v2.ID, pending.ID} {
+		if !seen[id] {
+			t.Fatalf("version %s missing after rename", id)
+		}
+	}
+	if info[0].ID != pending.ID || info[1].ID != v2.ID || !info[1].Current {
+		t.Fatalf("version order/current changed after rename: %+v", info)
+	}
+
+	got, err := store.ExportCurrentState("acme-prod", "dev-renamed", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != `{"serial":2}` {
+		t.Fatalf("export after rename = %s, want serial 2 payload", got)
+	}
+
+	var afterState, afterJSON []byte
+	if err := store.db.QueryRow(
+		`SELECT state, json_state FROM state_versions WHERE id = ?`, v2.ID,
+	).Scan(&afterState, &afterJSON); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterState, beforeState) || !bytes.Equal(afterJSON, beforeJSON) {
+		t.Fatal("rename rewrote encrypted state blobs")
+	}
+
+	var lineageCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM lineage_keys`).Scan(&lineageCount); err != nil {
+		t.Fatal(err)
+	}
+	if lineageCount != 1 {
+		t.Fatalf("lineage keys after rename = %d, want preserved 1", lineageCount)
+	}
+
+	summaries, err := store.ListStateSummaries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].ID != ws.ID || summaries[0].Organization != "acme-prod" || summaries[0].Name != "dev-renamed" {
+		t.Fatalf("summaries after rename = %+v", summaries)
+	}
+}
+
+func TestStateRenameRejects(t *testing.T) {
+	t.Run("missing source", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mgcl.db")
+		store := openTestStateStore(t, path, testIdentity(t))
+		if err := store.RenameState("acme", "missing", "acme", "new"); !IsAPIError(err, http.StatusNotFound) {
+			t.Fatalf("missing source error = %v, want 404", err)
+		}
+		if _, err := store.GetWorkspace("acme", "new"); !IsAPIError(err, http.StatusNotFound) {
+			t.Fatalf("destination created for missing source: %v", err)
+		}
+	})
+
+	t.Run("same reference", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mgcl.db")
+		store := openTestStateStore(t, path, testIdentity(t))
+		ws := createStateTestWorkspace(t, store, "acme", "dev")
+		if err := store.RenameState("acme", "dev", "acme", "dev"); !IsAPIError(err, http.StatusConflict) {
+			t.Fatalf("same reference error = %v, want 409", err)
+		}
+		got, err := store.GetWorkspaceByID(ws.ID)
+		if err != nil || got.Organization != "acme" || got.Name != "dev" {
+			t.Fatalf("same-reference rename changed the workspace: %+v, %v", got, err)
+		}
+	})
+
+	t.Run("destination exists", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mgcl.db")
+		store := openTestStateStore(t, path, testIdentity(t))
+		src := createStateTestWorkspace(t, store, "acme", "dev")
+		dest := createStateTestWorkspace(t, store, "acme", "keep")
+		createTestStateVersion(t, store, src.ID, 1, "src-lineage", "src-md5", []byte("raw-src"), []byte(`{"src":1}`), nil)
+		destVersion := createTestStateVersion(t, store, dest.ID, 1, "dest-lineage", "dest-md5", []byte("raw-dest"), []byte(`{"dest":1}`), nil)
+
+		if err := store.RenameState("acme", "dev", "acme", "keep"); !IsAPIError(err, http.StatusConflict) {
+			t.Fatalf("existing destination error = %v, want 409", err)
+		}
+		if _, err := store.GetWorkspace("acme", "dev"); err != nil {
+			t.Fatalf("source disappeared after conflict: %v", err)
+		}
+		info, err := store.ListStateVersionInfo("acme", "keep")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(info) != 1 || info[0].ID != destVersion.ID {
+			t.Fatalf("destination versions changed: %+v", info)
+		}
+		got, err := store.ExportCurrentState("acme", "keep", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != `{"dest":1}` {
+			t.Fatalf("destination state changed: %s", got)
+		}
+	})
+
+	t.Run("locked source", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mgcl.db")
+		store := openTestStateStore(t, path, testIdentity(t))
+		ws := createStateTestWorkspace(t, store, "acme", "dev")
+		if err := store.LockWorkspace(ws.ID, `{"id":"lock-rename"}`); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RenameState("acme", "dev", "acme", "new"); !IsAPIError(err, http.StatusConflict) {
+			t.Fatalf("locked source error = %v, want 409", err)
+		}
+		got, err := store.GetWorkspace("acme", "dev")
+		if err != nil || !got.Locked {
+			t.Fatalf("locked source changed after rejected rename: %+v, %v", got, err)
+		}
+	})
+
+	t.Run("invalid references", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "mgcl.db")
+		store := openTestStateStore(t, path, testIdentity(t))
+		ws := createStateTestWorkspace(t, store, "acme", "dev")
+		cases := [][4]string{
+			{"acme", "a b", "acme", "new"},
+			{"acme", "dev", "acme", "a/b"},
+			{"acme", "dev", "acme", "a%b"},
+			{"", "dev", "acme", "new"},
+			{"acme", "dev", "acme", ""},
+		}
+		for _, tc := range cases {
+			if err := store.RenameState(tc[0], tc[1], tc[2], tc[3]); err == nil {
+				t.Fatalf("RenameState(%q, %q, %q, %q) accepted an invalid reference", tc[0], tc[1], tc[2], tc[3])
+			}
+		}
+		got, err := store.GetWorkspaceByID(ws.ID)
+		if err != nil || got.Organization != "acme" || got.Name != "dev" {
+			t.Fatalf("invalid rename changed the workspace: %+v, %v", got, err)
+		}
+		if _, err := store.GetWorkspace("acme", "new"); !IsAPIError(err, http.StatusNotFound) {
+			t.Fatalf("invalid rename created a destination: %v", err)
 		}
 	})
 }

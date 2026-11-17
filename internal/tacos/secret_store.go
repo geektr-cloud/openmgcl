@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -58,8 +57,6 @@ var (
 	// automatically.
 	ErrSecretSchemaOutdated = errors.New("secret database schema is outdated: secret_kvs.is_ephemeral is missing; run mgcl-migrate to migrate this database")
 )
-
-var secretNameSegmentPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // SecretSummary is the plaintext metadata returned by ListSecrets.
 type SecretSummary struct {
@@ -122,24 +119,37 @@ type SecretStore struct {
 }
 
 // ValidSecretName reports whether name is a hierarchical Secret name. A name
-// is one or more slash-separated segments, each matching the v1 segment syntax,
-// with a total length of at most MaxSecretNameBytes.
+// is one or more slash-separated non-empty segments. Each segment must be
+// PathEscape-stable (segment == url.PathEscape(segment)), so characters such as
+// spaces, %, ?, #, *, non-ASCII bytes and slashes inside a segment are invalid.
+// The full name, including its separating slashes, is limited to
+// MaxSecretNameBytes. "." and ".." are ordinary segments because names are
+// never used as filesystem paths.
 func ValidSecretName(name string) bool {
 	if name == "" || len(name) > MaxSecretNameBytes {
 		return false
 	}
 	for _, segment := range strings.Split(name, "/") {
-		if !secretNameSegmentPattern.MatchString(segment) {
+		if !isPathEscapeStable(segment) {
 			return false
 		}
 	}
 	return true
 }
 
-// ValidSecretKey reports whether key is a single KV key segment. Keys never
-// contain a slash, even when the owning Secret name does.
+// ValidSecretKey reports whether key is a single KV key segment. A key is
+// non-empty, at most MaxSecretNameBytes long and PathEscape-stable
+// (key == url.PathEscape(key)). url.PathEscape escapes "/", so keys never
+// contain a slash.
 func ValidSecretKey(key string) bool {
-	return secretNameSegmentPattern.MatchString(key)
+	if key == "" || len(key) > MaxSecretNameBytes {
+		return false
+	}
+	return isPathEscapeStable(key)
+}
+
+func isPathEscapeStable(segment string) bool {
+	return segment != "" && segment == url.PathEscape(segment)
 }
 
 // ParseSecretReference splits a <secret-name>/<key> reference at its last

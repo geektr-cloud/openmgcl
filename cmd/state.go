@@ -39,12 +39,12 @@ required. --encryption-key-file (or MGCL_ENCRYPTION_KEY_FILE, or
 encryption_key_file) defaults to ~/.ssh/id_ed25519. list, stats and info are
 metadata-only and do not load the key. export and every write command load it.
 
-export, prune, delete and unlock are read-only until they have finished their
-preflight. Write commands then open a write session and honor --backup-to /
+export, prune, delete, unlock and rename are read-only until they have finished
+their preflight. Write commands then open a write session and honor --backup-to /
 backup_to. Stop other mgcl processes that write the same database before a
 write command; the backup shutdown is fail-closed.
 
-prune and delete never unlock a workspace. Run "state unlock" first.`,
+prune, delete and rename never unlock a workspace. Run "state unlock" first.`,
 	}
 	stateCmd.PersistentFlags().StringVarP(&flags.db, "db", "d", "", "SQLite database path (required)")
 	stateCmd.PersistentFlags().StringVar(&flags.keyFile, "encryption-key-file", "", "SSH Ed25519 private key (default \"~/.ssh/id_ed25519\")")
@@ -199,7 +199,28 @@ any backup. The result is written to stderr.`,
 		},
 	}
 
-	stateCmd.AddCommand(listCmd, statsCmd, infoCmd, exportCmd, pruneCmd, deleteCmd, unlockCmd)
+	renameCmd := &cobra.Command{
+		Use:   "rename <source> <destination>",
+		Short: "Rename a workspace and keep its state",
+		Long: `Rename one workspace to a new State reference without touching its state.
+
+Both arguments are full <organization>/<workspace> references; the organization
+and workspace name may both change. The workspace ID, every finalized and
+pending version, version IDs, created_at, and the encrypted state blobs are
+preserved. The source must exist, must not be locked, and the destination must
+not already exist; the destination is never overwritten. Renaming to the same
+reference is a conflict.
+
+This is a non-destructive write session: it needs no confirmation and works on
+non-TTY stdin. It reuses --backup-to / backup_to, and the result is written to
+stderr. A locked source must be unlocked first with "state unlock".`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runStateRename(cmd, flags, args[0], args[1])
+		},
+	}
+
+	stateCmd.AddCommand(listCmd, statsCmd, infoCmd, exportCmd, pruneCmd, deleteCmd, unlockCmd, renameCmd)
 	return stateCmd
 }
 
@@ -350,6 +371,38 @@ func runStateUnlock(cmd *cobra.Command, flags *stateFlags, ref string) error {
 			return "", err
 		}
 		return fmt.Sprintf("Unlocked workspace %s.", ref), nil
+	})
+}
+
+func runStateRename(cmd *cobra.Command, flags *stateFlags, srcRef, destRef string) error {
+	srcOrg, srcWorkspace, err := tacos.ParseStateReference(srcRef)
+	if err != nil {
+		return err
+	}
+	destOrg, destWorkspace, err := tacos.ParseStateReference(destRef)
+	if err != nil {
+		return err
+	}
+
+	err = withStateReadStore(cmd, flags, false, func(store *tacos.Store) error {
+		ws, err := store.GetStateWorkspace(srcOrg, srcWorkspace)
+		if err != nil {
+			return err
+		}
+		if ws.Locked {
+			return stateLockedError(srcRef)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return withStateWriteStore(cmd, flags, func(store *tacos.Store) (string, error) {
+		if err := store.RenameState(srcOrg, srcWorkspace, destOrg, destWorkspace); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Renamed state from %s to %s.", srcRef, destRef), nil
 	})
 }
 

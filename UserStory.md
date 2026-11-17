@@ -128,7 +128,7 @@ ls -A
 
 ## 5. 把 bootstrap 凭据交给 provider
 
-第一次用真实 provider apply 前需要的凭据（例如 AWS access key）也存进同一个 `mgcl.db`。`mgcl secret` 读同一份 `.mgcl.yaml`，不用再传其他参数。Secret name 可以由多个 `/` segment 组成，例如 `aws-605592676484-cn/scarborough`；每个 segment 仍匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`，完整名称不超过 64 字节。KV key 仍是单段，完整引用按最后一个 `/` 拆分：
+第一次用真实 provider apply 前需要的凭据（例如 AWS access key）也存进同一个 `mgcl.db`。`mgcl secret` 读同一份 `.mgcl.yaml`，不用再传其他参数。Secret name 可以由多个 `/` segment 组成，例如 `net.sxxfuture.infra`；每段必须满足 `segment == url.PathEscape(segment)`，完整名称不超过 64 字节，因此大小写、`.`、`..` 和前导 `-`/`_` 都合法，空格、`%`、`?`、`#`、`*` 与非 ASCII 非法。KV key 遵循同一约束且不含 `/`，完整引用按最后一个 `/` 拆分：
 
 ```bash
 mgcl secret create bootstrap

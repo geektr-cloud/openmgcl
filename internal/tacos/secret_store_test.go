@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,7 +150,13 @@ func TestSecretCreateListShow(t *testing.T) {
 	if _, err := store.ShowSecret("missing"); !errors.Is(err, ErrSecretNotFound) {
 		t.Fatalf("missing show error = %v", err)
 	}
-	for _, name := range []string{"", "Bootstrap", "a//b", "a/../b", "a b", strings.Repeat("a", 65), "-bad", "_bad"} {
+	validNames := []string{"net.sxxfuture.infra", "Net.SXXFuture.infra", ".", "..", ".hidden", "-leading", "_leading", "a/./b", "a/../b"}
+	for _, name := range validNames {
+		if _, err := store.CreateSecret(name); err != nil {
+			t.Errorf("valid name %q was rejected: %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "/", "a//b", "a/", "/a", "a b", "a%b", "a?b", "a#b", "*.wild", "工作区", strings.Repeat("a", 65)} {
 		if _, err := store.CreateSecret(name); err == nil {
 			t.Errorf("invalid name %q was accepted", name)
 		}
@@ -698,7 +705,7 @@ func TestSecretLimits(t *testing.T) {
 	if err := store.SetSecretValue("limits", "max", bytes.Repeat([]byte("x"), MaxSecretValueBytes)); err != nil {
 		t.Fatalf("64 KiB value rejected: %v", err)
 	}
-	if err := store.SetSecretValue("limits", "Bad", []byte("x")); err == nil {
+	if err := store.SetSecretValue("limits", "bad key", []byte("x")); err == nil {
 		t.Fatal("invalid key syntax accepted")
 	}
 	if err := store.SetSecretValue("limits", strings.Repeat("k", 65), []byte("x")); err == nil {
@@ -751,6 +758,10 @@ func TestParseSecretReference(t *testing.T) {
 		"a/b/c",
 		"aws-605592676484-cn/scarborough/region",
 		"a-b/c_d/e-f/key",
+		"A/Key",
+		"net.sxxfuture.infra/API_KEY",
+		"a/./b",
+		"a/../b",
 		strings.Repeat("a", 62) + "/b/c",
 	}
 	for _, ref := range valid {
@@ -764,8 +775,7 @@ func TestParseSecretReference(t *testing.T) {
 		}
 	}
 	invalid := []string{
-		"", "a", "a/", "/b", "a//b", "a/b/", "a/./b", "a/../b", ".",
-		"A/b", "a/B", "a b/c",
+		"", "a", "a/", "/b", "a//b", "a/b/", "a b/c", "a/%2F", "a/*", "a/b c", "a/é",
 		strings.Repeat("a", 65) + "/b",
 		strings.Repeat("a", 63) + "/b/c",
 		"a/" + strings.Repeat("b", 65),
@@ -782,6 +792,12 @@ func TestParseSecretReference(t *testing.T) {
 		"a/b",
 		"aws-605592676484-cn/scarborough",
 		strings.Repeat("a", 62) + "/b",
+		"A",
+		".",
+		"..",
+		"-leading",
+		"_leading",
+		"net.sxxfuture.infra",
 	}
 	for _, name := range validNames {
 		if !ValidSecretName(name) {
@@ -789,7 +805,7 @@ func TestParseSecretReference(t *testing.T) {
 		}
 	}
 	invalidNames := []string{
-		"", strings.Repeat("a", 65), "a//b", "/a", "a/", "a/./b", "a/../b", "a b/c", "A/b",
+		"", strings.Repeat("a", 65), "a//b", "/a", "a/", "a b/c", "a/b c", "a%b", "a?b", "a#b", "a/*", "é",
 		strings.Repeat("a", 63) + "/b",
 	}
 	for _, name := range invalidNames {
@@ -805,6 +821,85 @@ func TestParseSecretReference(t *testing.T) {
 	}
 	if ValidSecretKey(strings.Repeat("a", 65)) {
 		t.Fatal("65-character KV key was accepted")
+	}
+	for _, key := range []string{"A", "a.b", "..", "-leading", "_leading"} {
+		if !ValidSecretKey(key) {
+			t.Errorf("valid key %q was rejected", key)
+		}
+	}
+	for _, key := range []string{"", "a b", "%2F", "*", "é"} {
+		if ValidSecretKey(key) {
+			t.Errorf("invalid key %q was accepted", key)
+		}
+	}
+}
+
+func TestSecretNamePathEscapeEquivalence(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"net.sxxfuture.infra", true},
+		{"NET.SXXFuture.Infra", true},
+		{".", true},
+		{"..", true},
+		{"-", true},
+		{"_", true},
+		{"a.b-c_d", true},
+		{"~", true},
+		{"$&+=:@", true},
+		{"a b", false},
+		{"%", false},
+		{"a?b", false},
+		{"a#b", false},
+		{"*", false},
+		{"é", false},
+		{"a//b", false},
+		{"a/b/c", true},
+	}
+	for _, tc := range cases {
+		if got := ValidSecretName(tc.name); got != tc.want {
+			t.Errorf("ValidSecretName(%q) = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+
+	keys := []struct {
+		key  string
+		want bool
+	}{
+		{"A", true},
+		{"a.b", true},
+		{"..", true},
+		{"-x", true},
+		{"_x", true},
+		{"~", true},
+		{"", false},
+		{"a/b", false},
+		{"a b", false},
+		{"%2F", false},
+		{"*", false},
+		{"é", false},
+	}
+	for _, tc := range keys {
+		if got := ValidSecretKey(tc.key); got != tc.want {
+			t.Errorf("ValidSecretKey(%q) = %t, want %t", tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestSecretReferenceWildcardReserved(t *testing.T) {
+	// PathEscape escapes "*", so a wildcard is never PathEscape-stable and
+	// cannot collide with a real KV key.
+	if escaped := url.PathEscape("*"); escaped != "%2A" {
+		t.Fatalf("url.PathEscape(\"*\") = %q, want %q", escaped, "%2A")
+	}
+	for _, ref := range []string{"bootstrap/*", "net.sxxfuture.infra/*"} {
+		if _, _, err := ParseSecretReference(ref); err == nil {
+			t.Errorf("wildcard reference %q was accepted", ref)
+		}
+	}
+	if _, key, err := ParseSecretReference("net.sxxfuture.infra/API_KEY"); err != nil || key != "API_KEY" {
+		t.Fatalf("dotted name reference parsed as key %q, err %v", key, err)
 	}
 }
 

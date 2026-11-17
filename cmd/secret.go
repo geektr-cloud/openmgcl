@@ -31,9 +31,10 @@ func newSecretCmd() *cobra.Command {
 		Short: "Manage bootstrap secrets in the local database",
 		Long: `Manage bootstrap secrets offline in the same mgcl.db used by mgcl run.
 
-A Secret name is one or more /-separated segments; each segment matches
-^[a-z0-9][a-z0-9_-]{0,63}$ and the full name is at most 64 bytes. KV keys are a
-single segment without /. A KV reference is <secret-name>/<key>, split at the
+A Secret name is one or more /-separated non-empty segments; each segment must
+satisfy segment == url.PathEscape(segment) and the full name is at most 64
+bytes. KV keys are one non-empty PathEscape-stable segment of at most 64 bytes,
+so they never contain /. A KV reference is <secret-name>/<key>, split at the
 last /. Values are always encrypted at rest with a per-Secret DEK, which is
 wrapped by the configured SSH Ed25519 recipient.
 

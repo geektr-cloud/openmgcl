@@ -180,7 +180,7 @@ func TestSecretKVsWriteBatchValidationAPI(t *testing.T) {
 		want   int
 	}{
 		{"missing name", http.MethodPost, token, []byte(`{"kvs":[]}`), http.StatusBadRequest},
-		{"invalid name", http.MethodPost, token, []byte(`{"name":"Bad/Name","kvs":[]}`), http.StatusBadRequest},
+		{"invalid name", http.MethodPost, token, []byte(`{"name":"Bad//Name","kvs":[]}`), http.StatusBadRequest},
 		{"invalid key", http.MethodPost, token, []byte(`{"name":"valid","kvs":[{"key":"a/b","value":"v"}]}`), http.StatusBadRequest},
 		{"duplicate upsert", http.MethodPost, token, []byte(`{"name":"valid","kvs":[{"key":"a","value":"1"},{"key":"a","value":"2"}]}`), http.StatusBadRequest},
 		{"duplicate delete", http.MethodPost, token, []byte(`{"name":"valid","delete_keys":["a","a"]}`), http.StatusBadRequest},

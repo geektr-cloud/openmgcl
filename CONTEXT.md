@@ -24,11 +24,11 @@ _Avoid_: endpoint, API version
 workspace 的命名空间。任意字符串即隐式存在，无创建、无成员、无权限管理。
 
 **Workspace**:
-organization 下的具名状态容器。本项目一律为 local 执行模式，仅承载 state，不承载远程运行。
+organization 下的具名状态容器。本项目一律为 local 执行模式，仅承载 state，不承载远程运行。名称必须满足 `name == url.PathEscape(name)`，与 OpenTofu 的 workspace 校验一致：`/`、空格、`%`、`?`、`#` 和非 ASCII 字符都非法；既有数据不做迁移。
 _Avoid_: project, environment
 
 **State reference**:
-`<organization>/<workspace>` 形式的寻址字符串，供 `mgcl state` 命令定位 workspace。恰好包含一个 `/`，按第一个 `/` 拆分；两段都不能为空，也不能再含 `/`。
+`<organization>/<workspace>` 形式的寻址字符串，供 `mgcl state` 命令定位 workspace。恰好包含一个 `/`，按第一个 `/` 拆分；两段都不能为空。拆分后的 workspace 还必须满足 `name == url.PathEscape(name)`，与 OpenTofu 的 workspace 校验一致；organization 规则不变。
 _Avoid_: workspace ID, state path
 
 **State version**:
@@ -85,6 +85,10 @@ _Avoid_: state dump, backup（备份指整库副本）
 State delete 删除一个 workspace 及其全部 finalized 与 pending 版本；State unlock 离线强制清除 workspace lock。两者都用完整 State reference 确认，都不清理 Lineage Key；prune/delete 遇到 locked 时拒绝，须先停止写进程再 unlock。
 _Avoid_: destroy, rollback
 
+**State rename**:
+把一个 workspace 的 organization 和/或 name 改为另一个 State reference。只更新原 workspace 行的 organization 与 name，保留 workspace ID、全部版本与 version ID、created_at、加密 state blob 与 Lineage；不解密或重写 state。源必须存在且未锁定；同名或目标已存在时冲突，不覆盖。非破坏性操作，不需要交互确认。
+_Avoid_: move, copy（不复制，也不改变 workspace 身份）
+
 **Foreign upload / download**:
 客户端对服务端签发的上传/下载 URL 发起的原始字节请求（`application/octet-stream`），不携带 Bearer 凭据。
 
@@ -100,7 +104,7 @@ workspace 级互斥锁，防止并发写 state；有 lock / unlock / force-unloc
 _Avoid_: state output, managed resource
 
 **Secret name**:
-Secret 的层级名称，由一个或多个 `/` 分隔的 segment 组成。每个 segment 匹配 `^[a-z0-9][a-z0-9_-]{0,63}$`；完整名称（含 `/`）不超过 64 字节。空 segment、`.` 和 `..` 都不是合法 segment；旧单段名称继续兼容。例如 `aws-605592676484-cn/scarborough`。
+Secret 的层级名称，由一个或多个 `/` 分隔的非空 segment 组成。每个 segment 必须满足 `segment == url.PathEscape(segment)`；完整名称（含 `/`）不超过 64 字节。大小写、`.`、`..`、前导 `-`/`_` 以及其他 PathEscape-stable 字符合法；空格、`%`、`?`、`#`、`*`、非 ASCII 和空 segment 非法。旧名称全部继续合法，不需要迁移。例如 `net.sxxfuture.infra`。
 _Avoid_: path, namespace
 
 **Ephemeral KV**:
@@ -112,7 +116,7 @@ _Avoid_: private secret（易与静态加密混淆）
 _Avoid_: plaintext secret, unencrypted secret
 
 **KV**:
-Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。每个 KV 独立携带 `is_ephemeral` 访问标记。KV key 永远是单个 segment，不含 `/`。
+Secret 内的一个具名字符串条目。每个 KV 的值单独加密，但同一 Secret 的所有 KV 共用该 Secret 的 Secret DEK；只保留最新值，没有历史版本。每个 KV 独立携带 `is_ephemeral` 访问标记。KV key 非空、最多 64 字节且满足 `key == url.PathEscape(key)`；因为 `/` 会被转义，key 永远不含 `/`。
 _Avoid_: secret version, key-value file
 
 **KV reference**:
@@ -136,5 +140,5 @@ _Avoid_: MGCL_TOKEN, user token
 _Avoid_: backup target, snapshot, dump
 
 **Write session**:
-打开 `mgcl.db` 并可能提交写入的进程生命周期，例如 `mgcl run` 服务、`mgcl secret create/set/unset/delete` 与 `mgcl state prune/delete/unlock`。每个写会话必须复用同一备份层；只读命令不是写会话。
+打开 `mgcl.db` 并可能提交写入的进程生命周期，例如 `mgcl run` 服务、`mgcl secret create/set/unset/delete` 与 `mgcl state prune/delete/unlock/rename`。每个写会话必须复用同一备份层；只读命令不是写会话。
 _Avoid_: backup job, sync process
